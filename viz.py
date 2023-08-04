@@ -20,7 +20,7 @@ def show(image, ax):
 
 
 def show_images(images, subplot_y=None, subplot_x=None):
-    assert issubclass(type(images), (np.ndarray, tf.Tensor, list, tuple))
+    assert isinstance(images, (np.ndarray, tf.Tensor, list, tuple))
     subplot_x = min([len(images), 4]) if subplot_x is None else subplot_x
     subplot_y = len(images) // subplot_x if subplot_y is None else subplot_y
 

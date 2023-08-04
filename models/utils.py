@@ -1,33 +1,21 @@
 import tensorflow as tf
-from collections import namedtuple
 
-
-class Argument(dict):
-    def __init__(self, name, **kwargs):
-        super(Argument, self).__init__(**kwargs)
-        self.name = name
-
-    def export(self):
-        keys = ' '.join(list(self.keys()))
-        args = namedtuple(self.name, keys)
-        return args(**self)
-
-
-class Config_node(dict):
-    def __init__(self, name, **kwargs):
-        super(Config_node, self).__init__()
+class Config(dict):
+    def __init__(self, name, configs=None, **kwargs):
+        configs = {} if configs is None else configs
+        super(Config, self).__init__(**configs)
         self.name = name
         self.__dict__.update(**kwargs)
-        self.sub_models = {}
 
-    def export(self):
-        keys = ' '.join(list(self.keys()))
-        args = namedtuple(self.name, keys)
-        return args(**self)
+    def update_class_dict(self, **kwargs):
+        if 'name' in kwargs.keys():
+            raise ValueError(
+                '"name" is unchangeable value'
+            )
+        self.__dict__.update(**kwargs)
 
-    def update(self, name, kwargs):
-        self.sub_models[name] = True
-        super().update(**{name: kwargs})
+    def get_from_class_dict(self, key):
+        return self.__dict__.get(key)
 
 
 def compute_output_shape(
@@ -39,8 +27,9 @@ def compute_output_shape(
         filters=None,
         transform=False
 ):
-    assert issubclass(type(input_shape), tf.TensorShape)
+    assert isinstance(input_shape, tf.TensorShape)
     assert input_shape.ndims == 3
+
     Hin, Win, Din = tf.unstack(tf.cast(input_shape, dtype=tf.float32))
     paddings = (0, 0) if paddings == 'valid' else (kernel_size[0] // 2, kernel_size[1] // 2)
     dilation = dilation or (1, 1)
@@ -69,3 +58,5 @@ def copy_layer(layer, name=None, include_weights=False):
         new_layer.set_weights(weights)
 
     return new_layer
+
+
