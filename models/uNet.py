@@ -86,16 +86,17 @@ def base_configs(layer_name, **kwargs):
 
 class UNET:
     def __init__(self, unet_levels=5, init_filters=64, num_classes=1, name=None):
-        self.name = name
+        self.name = name or 'UNET'
         self.unet_levels = unet_levels
         self.init_filters = init_filters
         self.output_dim = num_classes
         self.__setup_base()
-        # TODO: concat function to avoid shape error
+        # TODO: Normalization instance, group abd layer.
+        # TODO: add validation between the levels and input shape.
 
     def __setup_base(self):
-        self.dbl_conv_encode = Config('dbl_conv', block='encoder', fn=None, mode='base')
-        self.dbl_conv_encode.update(
+        self.dbl_conv_encoder = Config('dbl_conv', block='encoder', fn=None, mode='base')
+        self.dbl_conv_encoder.update(
             conv=base_configs('conv'),
             bn=base_configs('bn'),
             act=base_configs('act'),
@@ -134,7 +135,7 @@ class UNET:
             act=base_configs('act', activation='softmax')
         )
         self.config_names = [
-            'dbl_conv_encode',
+            'dbl_conv_encoder',
             'down_sample',
             'dbl_conv_middle',
             'up_sample',
@@ -153,11 +154,10 @@ class UNET:
 
         for u in tf.range(self.unet_levels - 1):
             with tf.name_scope(f'E_U{u + 1}') as unit_name:
-                X = self.__double_conv(inputs if u == 0 else X, filters, self.dbl_conv_encode)
-
+                X = self.__double_conv(inputs if u == 0 else X, filters, self.dbl_conv_encoder)
                 identity_map.append(Identity(name=unit_name + 'X_copy')(X))
-
                 X = self.__down_sample(X, self.down_sample)
+
                 filters = filters * 2
 
         with tf.name_scope('middle_block'):
@@ -166,26 +166,15 @@ class UNET:
         filters = filters // 2
 
         for u in tf.range(self.unet_levels - 1, 0, -1):
-            with tf.name_scope(f'D_U{u}') as unit_name:
+            with tf.name_scope(f'D_U{u}'):
                 X = self.__up_sample(X, filters, self.up_sample)
-                X = concatenate((X, identity_map[u - 1]), axis=-1, name=unit_name + 'concat')
+                X = self.__concat(X, identity_map[u - 1], method='crop', interpolation='bilinear', output_as='X1')
                 X = self.__double_conv(X, filters, self.dbl_conv_decoder)
 
                 filters = filters // 2
 
-        configs = self.output_conv
-        with tf.name_scope('output') as scope_name:
-            # TODO: costume function like for middle
-            X = Conv2D(filters=self.output_dim, name=scope_name + 'cn', **configs.get('conv', {}))(X)
-            act_config = configs.get('act')
-            if act_config is None:
-                raise ValueError('activation configs is missing')
-            act_config = act_config.get('activation')
-            if issubclass(type(act_config), tf.keras.layers.Layer):
-                act = copy_layer(act_config, name=scope_name + 'act', include_weights=False)
-            else:
-                act = Activation(name=scope_name + 'act', **configs.get('act', {}))
-            X = act(X)
+        X = self.__output_conv(X, self.output_dim, self.output_conv)
+
         return keras.Model(inputs, X, name=self.name)
 
     def change_setup(self, config_name, sub_model=None, **kwargs):
@@ -219,8 +208,7 @@ class UNET:
 
         con.update_class_dict(**kwargs)
 
-    @staticmethod
-    def __double_conv(X, filters, configs):
+    def __double_conv(self, X, filters, configs):
         user_fn = configs.get_from_class_dict('fn')
         if user_fn is not None:
             return user_fn(X, filters, configs)
@@ -253,12 +241,11 @@ class UNET:
             X = act1(norm1(conv1(X)))
             X = norm2(conv2(X))
             if configs.mode == 'resnet':
-                X = concatenate((X, X_copy), axis=-1, name=scope_name + 'concat')
+                X = self.__concat(X, X_copy, method='resize', interpolation='bilinear', output_as='X1')
             X = act2(X)
             return X
 
-    @staticmethod
-    def __down_sample(X, configs):
+    def __down_sample(self, X, configs):
         user_fn = configs.get_from_class_dict('fn')
         if user_fn is not None:
             return user_fn(X, configs)
@@ -275,8 +262,7 @@ class UNET:
                 X = dropout(X)
             return X
 
-    @staticmethod
-    def __up_sample(X, filters, configs):
+    def __up_sample(self, X, filters, configs):
         user_fn = configs.get_from_class_dict('fn')
         if user_fn is not None:
             return user_fn(X, configs)
@@ -293,8 +279,52 @@ class UNET:
                 X = dropout(X)
             return X
 
+    def __concat(self, X1, X2, method='resize', interpolation='bilinear', output_as='X1'):
+        assert X1.shape[0] == X2.shape[0]
+        target_shape = X1.shape if output_as == 'X1' else X2.shape
+        resize_x, other_x = (X2, X1) if output_as == 'X1' else (X1, X2)
+
+        _, ht, wt, _ = target_shape
+        _, h, w, _ = resize_x.shape
+        assert (method == 'crop' and h <= ht and w <= wt) or method == 'resize'
+        dh = h - ht
+        dw = w - wt
+
+        scope_name = tf.get_current_name_scope()
+        if scope_name:
+            scope_name += '/'
+        if dh == 0 and dw == 0:
+            X = concatenate((X1, X2), axis=-1, name=scope_name + 'concat')
+            return X
+
+        if method == 'crop':
+            resize_x = Cropping2D(
+                cropping=((dh // 2, dh - dh // 2), (dw // 2, dw - dw // 2)), name=scope_name + 'crop'
+            )(resize_x)
+        else:
+            resize_x = Resizing(ht, wt, interpolation=interpolation, name=scope_name + 'resize')(resize_x)
+        concat_tup = (other_x, resize_x) if output_as == 'X1' else (resize_x, other_x)
+        X = concatenate(concat_tup, axis=-1, name=scope_name + 'concat')
+        return X
+
+    def __output_conv(self, X, filters, configs):
+        with tf.name_scope('output_conv') as scope_name:
+            X = Conv2D(filters=filters, name=scope_name + 'cn', **configs.get('conv', {}))(X)
+            act_config = configs.get('act')
+            if act_config is None:
+                raise ValueError('activation configs is missing')
+            act_config = act_config.get('activation')
+            if issubclass(type(act_config), tf.keras.layers.Layer):
+                act = copy_layer(act_config, name=scope_name + 'act', include_weights=False)
+            else:
+                act = Activation(name=scope_name + 'act', **configs.get('act', {}))
+            X = act(X)
+            return X
+
 
 if __name__ == '__main__':
-    m = UNET()
-    model = m.build((128, 128, 3))
-    # m.change_setup('dbl_conv_decoder', mode='resnet')
+    model_setup = UNET()
+    # model_setup.change_setup('dbl_conv_encoder', mode='resnet')
+    # model_setup.change_setup('dbl_conv_encoder', mode='resnet')
+    model = model_setup.build((128, 128, 3))
+    model.summary()
