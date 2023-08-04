@@ -217,12 +217,10 @@ class UNET:
             conv2 = Conv2D(filters=filters, name=scope_name + 'cn2', **configs.get('conv'))
             if configs.mode == 'resnet':
                 id_config = configs.get('convID', {})
-                if not id_config:
-                    id_config.update(**configs.get('conv'))
-                    id_config['kernel_size'] = (1, 1)
-                conv3 = Conv2D(filters=filters, name=scope_name + 'cnId', **id_config)
                 X_copy = Identity(name=scope_name + 'Xcopy')(X)
-                X_copy = conv3(X_copy)
+                if id_config:
+                    conv3 = Conv2D(filters=filters, name=scope_name + 'cnId', **id_config)
+                    X_copy = conv3(X_copy)
 
             norm1 = BatchNormalization(name=scope_name + 'bn1', **configs.get('bn', {}))
             norm2 = BatchNormalization(name=scope_name + 'bn2', **configs.get('bn', {}))
@@ -324,7 +322,6 @@ class UNET:
 
 if __name__ == '__main__':
     model_setup = UNET()
-    # model_setup.change_setup('dbl_conv_encoder', mode='resnet')
     # model_setup.change_setup('dbl_conv_encoder', mode='resnet')
     model = model_setup.build((128, 128, 3))
     model.summary()

@@ -1,5 +1,6 @@
 import tensorflow as tf
 
+
 class Config(dict):
     def __init__(self, name, configs=None, **kwargs):
         configs = {} if configs is None else configs
@@ -58,5 +59,3 @@ def copy_layer(layer, name=None, include_weights=False):
         new_layer.set_weights(weights)
 
     return new_layer
-
-
