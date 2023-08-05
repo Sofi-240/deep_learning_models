@@ -14,8 +14,8 @@ class UnetSetup:
         self.output_dim = num_classes
         self.config = _base_setup(mode=conv_mode)
 
-    def change_setup(self, config_name, sub_model=None, **kwargs):
-        if config_name not in self.config.keys():
+    def change_setup(self, config_name=None, sub_model=None, **kwargs):
+        if config_name is not None and config_name not in self.config.keys():
             raise ValueError(
                 f'Unknown sub model name {config_name}'
             )
@@ -30,7 +30,7 @@ class UnetSetup:
             return
 
         change_mode = kwargs.get('mode')
-        if con is not None and con.name == 'dbl_conv' and change_mode is not None:
+        if change_mode is not None:
             if change_mode != 'resnet' and change_mode != 'base':
                 raise ValueError(
                     f'mode for double convolution except base or resnet'
@@ -214,10 +214,10 @@ def build(input_shape, unet_levels=5, init_filters=64, num_classes=1, conv_mode=
 
 
 if __name__ == '__main__':
-    # model_setup = UNET((128, 128, 3))
-    # model_setup.change_setup('dbl_conv_encoder', mode='resnet')
-    model = build((128, 128, 3), unet_levels=3)
-    model.summary()
+    model_setup = UnetSetup()
+    model_setup.change_setup(mode='resnet')
+    # model = build((128, 128, 3), unet_levels=3)
+    # model.summary()
     # tf.keras.utils.plot_model(
     #     model,
     #     to_file='model.png',
