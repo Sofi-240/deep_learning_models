@@ -1,3 +1,5 @@
+from typing import Union
+
 import tensorflow as tf
 from keras.layers import Activation, BatchNormalization, GroupNormalization, Cropping2D, Resizing
 from networks.configs import copy_layer
@@ -11,16 +13,15 @@ def copy_current_name_scope():
 
 
 def compute_output_shape(
-        input_shape,
-        kernel_size,
-        strides,
-        paddings,
-        dilation=None,
-        filters=None,
-        transform=False
+        input_shape: Union[list, tuple, tf.TensorShape],
+        kernel_size: Union[list, tuple, tf.Tensor],
+        strides: Union[list, tuple, tf.Tensor],
+        paddings: Union[list, tuple, tf.Tensor],
+        dilation: Union[list, tuple, tf.Tensor, None] = None,
+        filters: Union[list, tuple, tf.Tensor, None] = None,
+        transform: bool = False
 ):
-    assert isinstance(input_shape, tf.TensorShape)
-    assert input_shape.ndims == 3
+    assert len(input_shape) == 3
 
     Hin, Win, Din = tf.unstack(tf.cast(input_shape, dtype=tf.float32))
     paddings = (0, 0) if paddings == 'valid' else (kernel_size[0] // 2, kernel_size[1] // 2)

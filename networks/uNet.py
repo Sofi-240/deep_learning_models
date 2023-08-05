@@ -1,55 +1,12 @@
 import tensorflow as tf
 from tensorflow import keras
-from typing import Callable
+from typing import Callable, Union
 from networks.configs import BlockConfig, copy_layer
 from networks.utils import activation_from_config, normalization_from_config, resize_as, copy_current_name_scope
 from keras.layers import Conv2D, MaxPooling2D, Dropout, Conv2DTranspose, Add, concatenate, Identity
 
 
-class UnetSetup:
-    def __init__(self, unet_levels=5, init_filters=64, num_classes=1, conv_mode='base', name=None):
-        self.name = name or 'UnetSetup'
-        self.unet_levels = unet_levels
-        self.init_filters = init_filters
-        self.output_dim = num_classes
-        self.config = _base_setup(mode=conv_mode)
-
-    def change_setup(self, config_name=None, sub_model=None, **kwargs):
-        if config_name is not None and config_name not in self.config.keys():
-            raise ValueError(
-                f'Unknown sub model name {config_name}'
-            )
-        con = self.config.get(config_name)
-
-        if sub_model is not None and con is not None:
-            assert isinstance(sub_model, str)
-            if sub_model in con.layers:
-                con.update_layer_config(sub_model, **kwargs)
-            else:
-                con.add_layer_config(sub_model, **kwargs)
-            return
-
-        change_mode = kwargs.get('mode')
-        if change_mode is not None:
-            if change_mode != 'resnet' and change_mode != 'base':
-                raise ValueError(
-                    f'mode for double convolution except base or resnet'
-                )
-            for item in self.config.values():
-                if item.name == 'dbl_conv':
-                    item.update_class(**dict(mode=change_mode))
-
-        user_fn = kwargs.get('fn')
-        if user_fn is not None and con is not None:
-            if not isinstance(user_fn, Callable):
-                raise ValueError('costume function need to be callable')
-            con.update_class(**kwargs)
-
-    def build_model(self):
-        pass
-
-
-def _base_setup(mode='base'):
+def _base_setup(mode: str = 'base'):
     assert mode == 'base' or mode == 'resnet'
     dbl_conv_encoder = BlockConfig('dbl_conv', block='encoder', mode=mode, fn=None)
     dbl_conv_encoder.add_layer_config('conv', from_base=True, call_name='conv2d')
@@ -89,7 +46,7 @@ def _base_setup(mode='base'):
     return unet_config
 
 
-def _double_conv(inputs, filters, configs):
+def __double_conv(inputs, filters, configs):
     user_fn = configs.get_from_class('fn')
     if user_fn is not None:
         return user_fn(inputs, filters, configs)
@@ -119,7 +76,7 @@ def _double_conv(inputs, filters, configs):
     return X
 
 
-def _down_sample(X, configs):
+def __down_sample(X, configs):
     user_fn = configs.get_from_class('fn')
     if user_fn is not None:
         return user_fn(X, configs)
@@ -142,7 +99,7 @@ def _down_sample(X, configs):
     return X
 
 
-def _up_sample(X, filters, configs):
+def __up_sample(X, filters, configs):
     user_fn = configs.get_from_class('fn')
     if user_fn is not None:
         return user_fn(X, configs)
@@ -164,7 +121,7 @@ def _up_sample(X, filters, configs):
     return X
 
 
-def _output_conv(X, filters, configs):
+def __output_conv(X, filters, configs):
     user_fn = configs.get_from_class('fn')
     if user_fn is not None:
         return user_fn(X, configs)
@@ -177,10 +134,69 @@ def _output_conv(X, filters, configs):
     return X
 
 
-def build(input_shape, unet_levels=5, init_filters=64, num_classes=1, conv_mode='base', name=None):
+class UnetSetup:
+    def __init__(self,
+                 unet_levels: int = 5,
+                 init_filters: int = 64,
+                 num_classes: int = 1,
+                 conv_mode: str = 'base',
+                 name: Union[None, str] = None):
+        assert unet_levels >= 2 and init_filters >= 0 and num_classes >= 0
+        self.name = name or 'UnetSetup'
+        self.unet_levels = unet_levels
+        self.init_filters = init_filters
+        self.output_dim = num_classes
+        self.config = _base_setup(mode=conv_mode)
+
+    def change_setup(self,
+                     config_name: Union[None, str] = None,
+                     sub_model: Union[None, str] = None,
+                     **kwargs):
+        if config_name is not None and config_name not in self.config.keys():
+            raise ValueError(
+                f'Unknown sub model name {config_name}'
+            )
+        con = self.config.get(config_name)
+
+        if sub_model is not None and con is not None:
+            assert isinstance(sub_model, str)
+            if sub_model not in con.keys():
+                raise KeyError(sub_model)
+            con.update_layer_config(sub_model, **kwargs)
+
+        change_mode = kwargs.get('mode')
+        if change_mode is not None:
+            if change_mode != 'resnet' and change_mode != 'base':
+                raise ValueError(f'mode for double convolution except base or resnet')
+
+            for item in self.config.values():
+                if item.name == 'dbl_conv':
+                    item.update_class(**dict(mode=change_mode))
+
+        user_fn = kwargs.get('fn')
+        if user_fn is not None and con is not None:
+            if not isinstance(user_fn, Callable):
+                raise ValueError('costume function need to be callable')
+            con.update_class(**kwargs)
+
+    def build_model(self):
+        pass
+
+
+def UnetModel(
+        input_shape: Union[tuple, list, tf.TensorShape],
+        unet_levels: int = 5,
+        init_filters: int = 64,
+        num_classes: int = 1,
+        conv_mode: str = 'base',
+        name: Union[None, str] = None):
+
     input_shape = tf.TensorShape(input_shape)
     input_shape.assert_has_rank(3)
+    assert unet_levels >= 2 and init_filters >= 0 and num_classes >= 0
+
     setup = _base_setup(mode=conv_mode)
+
     filters = tf.cast(init_filters, dtype=tf.int32)
     identity_map = []
 
@@ -188,35 +204,35 @@ def build(input_shape, unet_levels=5, init_filters=64, num_classes=1, conv_mode=
 
     for u in tf.range(unet_levels - 1):
         with tf.name_scope(f'E_U{u + 1}') as unit_name:
-            X = _double_conv(inputs if u == 0 else X, filters, setup.get('dbl_conv_encoder'))
+            X = __double_conv(inputs if u == 0 else X, filters, setup.get('dbl_conv_encoder'))
             identity_map.append(Identity(name=unit_name + 'X_copy')(X))
-            X = _down_sample(X, setup.get('down_sample_encoder'))
+            X = __down_sample(X, setup.get('down_sample_encoder'))
 
             filters = filters * 2
 
     with tf.name_scope('middle_block'):
-        X = _double_conv(X, filters, setup.get('dbl_conv_middle'))
+        X = __double_conv(X, filters, setup.get('dbl_conv_middle'))
 
     filters = filters // 2
 
     for u in tf.range(unet_levels - 1, 0, -1):
         with tf.name_scope(f'D_U{u}') as unit_name:
-            X = _up_sample(X, filters, setup.get('up_sample_decoder'))
+            X = __up_sample(X, filters, setup.get('up_sample_decoder'))
             X, X_copy = resize_as(X, identity_map[u - 1], method='crop', interpolation='bilinear', output_as='X1')
             X = concatenate((X, X_copy), name=unit_name + 'concat')
-            X = _double_conv(X, filters, setup.get('dbl_conv_decoder'))
+            X = __double_conv(X, filters, setup.get('dbl_conv_decoder'))
 
             filters = filters // 2
 
-    X = _output_conv(X, num_classes, setup.get('output_block'))
+    X = __output_conv(X, num_classes, setup.get('output_block'))
 
     return keras.Model(inputs, X, name=name)
 
 
 if __name__ == '__main__':
-    model_setup = UnetSetup()
-    model_setup.change_setup(mode='resnet')
-    # model = build((128, 128, 3), unet_levels=3)
+    # model_setup = UnetSetup()
+    # model_setup.change_setup(mode='resnet')
+    model = UnetModel(tf.TensorShape((128, 128, 3)), unet_levels=3)
     # model.summary()
     # tf.keras.utils.plot_model(
     #     model,
