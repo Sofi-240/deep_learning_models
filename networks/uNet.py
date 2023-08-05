@@ -35,9 +35,8 @@ class UnetSetup:
                 raise ValueError(
                     f'mode for double convolution except base or resnet'
                 )
-            for key, item in self.config.items():
-                split_key = key.split('_')
-                if split_key[0] == 'dbl' and len(split_key) > 1 and split_key[1] == 'conv':
+            for item in self.config.values():
+                if item.name == 'dbl_conv':
                     item.update_class(**dict(mode=change_mode))
 
         user_fn = kwargs.get('fn')
@@ -215,11 +214,10 @@ def build(input_shape, unet_levels=5, init_filters=64, num_classes=1, conv_mode=
 
 
 if __name__ == '__main__':
-    setup = _base_setup(mode='resnet')
     # model_setup = UNET((128, 128, 3))
     # model_setup.change_setup('dbl_conv_encoder', mode='resnet')
-    # model = build((128, 128, 3), unet_levels=3)
-    # model.summary()
+    model = build((128, 128, 3), unet_levels=3)
+    model.summary()
     # tf.keras.utils.plot_model(
     #     model,
     #     to_file='model.png',
