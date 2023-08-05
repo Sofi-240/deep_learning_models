@@ -4,7 +4,7 @@ from typing import Callable
 from models.configs import copy_layer, Config, base_configs
 from models.utils import activation_from_config, normalization_from_config
 from keras.layers import Conv2D, MaxPooling2D, Dropout, Conv2DTranspose, Identity, \
-    concatenate, Resizing, Cropping2D
+    concatenate, Resizing, Cropping2D, Add
 
 
 class UNET:
@@ -154,7 +154,7 @@ class UNET:
             X = act1(norm1(conv1(X)))
             X = norm2(conv2(X))
             if configs.mode == 'resnet':
-                X = self.__concat(X, X_copy, method='resize', interpolation='bilinear', output_as='X1')
+                X = Add(name=scope_name + 'add')((X, X_copy))
             X = act2(X)
             return X
 
