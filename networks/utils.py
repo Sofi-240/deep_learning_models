@@ -1,6 +1,6 @@
 import tensorflow as tf
 from models.configs import copy_layer
-from keras.layers import Activation, BatchNormalization, GroupNormalization
+from keras.layers import Activation, BatchNormalization, GroupNormalization, Cropping2D, Resizing
 
 
 def compute_output_shape(
@@ -48,7 +48,7 @@ def normalization_from_config(config, name=None):
     norm_config = config.get('norm')
     if norm_config is None:
         raise ValueError('normalization configs is missing')
-    norm = norm_config.get_from_class_dict('norm')
+    norm = norm_config.get_from_class('norm')
     if issubclass(type(norm), tf.keras.layers.Layer):
         norm_layer = copy_layer(norm, name=name, include_weights=False)
     else:
@@ -62,3 +62,27 @@ def normalization_from_config(config, name=None):
         else:
             norm_layer = None
     return norm_layer
+
+
+def resize_as(X1, X2, method='resize', interpolation='bilinear', output_as='X1'):
+    assert X1.shape[0] == X2.shape[0]
+    target_shape = X1.shape if output_as == 'X1' else X2.shape
+    resize_x, other_x = (X2, X1) if output_as == 'X1' else (X1, X2)
+
+    _, ht, wt, _ = target_shape
+    _, h, w, _ = resize_x.shape
+    assert (method == 'crop' and h <= ht and w <= wt) or method == 'resize'
+    dh = h - ht
+    dw = w - wt
+
+    scope_name = tf.get_current_name_scope()
+    if scope_name:
+        scope_name += '/'
+
+    if method == 'crop' and dh != 0 and dw != 0:
+        resize_x = Cropping2D(
+            cropping=((dh // 2, dh - dh // 2), (dw // 2, dw - dw // 2)), name=scope_name + 'crop'
+        )(resize_x)
+    elif dh != 0 or dw != 0:
+        resize_x = Resizing(ht, wt, interpolation=interpolation, name=scope_name + 'resize')(resize_x)
+    return (other_x, resize_x) if output_as == 'X1' else (resize_x, other_x)

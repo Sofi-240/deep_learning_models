@@ -145,3 +145,16 @@ class BlockConfig(Config):
         del self.layers[del_l]
         self.pop(name)
 
+
+def copy_layer(layer, name=None, include_weights=False, **updates):
+    config = layer.get_config()
+    config['name'] = name or config['name'] + '_2'
+    config.update(**updates)
+    new_layer = type(layer).from_config(config)
+
+    if layer.built and include_weights:
+        weights = layer.get_weights()
+        new_layer.build(layer.input_shape)
+        new_layer.set_weights(weights)
+
+    return new_layer
