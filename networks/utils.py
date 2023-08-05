@@ -1,6 +1,13 @@
 import tensorflow as tf
-from models.configs import copy_layer
 from keras.layers import Activation, BatchNormalization, GroupNormalization, Cropping2D, Resizing
+from networks.configs import copy_layer
+
+
+def copy_current_name_scope():
+    scope_name = tf.get_current_name_scope()
+    if scope_name:
+        scope_name += '/'
+    return scope_name
 
 
 def compute_output_shape(

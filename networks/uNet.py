@@ -1,8 +1,8 @@
 import tensorflow as tf
 from tensorflow import keras
 from typing import Callable
-from networks.configs import BlockConfig, Config, copy_layer
-from networks.utils import activation_from_config, normalization_from_config, resize_as
+from networks.configs import BlockConfig, copy_layer
+from networks.utils import activation_from_config, normalization_from_config, resize_as, copy_current_name_scope
 from keras.layers import Conv2D, MaxPooling2D, Dropout, Conv2DTranspose, Add, concatenate, Identity
 
 
@@ -12,42 +12,42 @@ class UnetSetup:
         self.unet_levels = unet_levels
         self.init_filters = init_filters
         self.output_dim = num_classes
-        setup = _base_setup(mode=conv_mode)
-        self.config_names = list(setup.keys())
-        self.__dict__.update(**setup)
+        self.config = _base_setup(mode=conv_mode)
 
     def change_setup(self, config_name, sub_model=None, **kwargs):
-        if config_name not in self.config_names:
+        if config_name not in self.config.keys():
             raise ValueError(
                 f'Unknown sub model name {config_name}'
             )
-        con = self.__getattribute__(config_name)
+        con = self.config.get(config_name)
 
-        if sub_model is not None:
+        if sub_model is not None and con is not None:
             assert isinstance(sub_model, str)
-            sub_con = con.get(sub_model)
-            if sub_con is None:
-                con.update(sub_model=kwargs)
+            if sub_model in con.layers:
+                con.update_layer_config(sub_model, **kwargs)
             else:
-                sub_con.update(**kwargs)
+                con.add_layer_config(sub_model, **kwargs)
             return
 
-        # change_mode = kwargs.get('mode')
-        # if con.name == 'dbl_conv' and change_mode is not None:
-        #     if change_mode != 'resnet' and change_mode != 'base':
-        #         raise ValueError(
-        #             f'mode for double convolution except base or resnet'
-        #         )
+        change_mode = kwargs.get('mode')
+        if con is not None and con.name == 'dbl_conv' and change_mode is not None:
+            if change_mode != 'resnet' and change_mode != 'base':
+                raise ValueError(
+                    f'mode for double convolution except base or resnet'
+                )
+            for key, item in self.config.items():
+                split_key = key.split('_')
+                if split_key[0] == 'dbl' and len(split_key) > 1 and split_key[1] == 'conv':
+                    item.update_class(**dict(mode=change_mode))
 
         user_fn = kwargs.get('fn')
-        if user_fn is not None:
+        if user_fn is not None and con is not None:
             if not isinstance(user_fn, Callable):
                 raise ValueError('costume function need to be callable')
-
-        con.update_class_dict(**kwargs)
+            con.update_class(**kwargs)
 
     def build_model(self):
-        return
+        pass
 
 
 def _base_setup(mode='base'):
@@ -95,9 +95,7 @@ def _double_conv(inputs, filters, configs):
     if user_fn is not None:
         return user_fn(inputs, filters, configs)
 
-    scope_name = tf.get_current_name_scope()
-    if scope_name:
-        scope_name += '/'
+    scope_name = copy_current_name_scope()
 
     conv1 = Conv2D(filters=filters, name=scope_name + 'cn1', **configs.get('conv'))
     conv2 = Conv2D(filters=filters, name=scope_name + 'cn2', **configs.get('conv'))
@@ -127,7 +125,7 @@ def _down_sample(X, configs):
     if user_fn is not None:
         return user_fn(X, configs)
 
-    scope_name = tf.get_current_name_scope()
+    scope_name = copy_current_name_scope()
     if scope_name:
         scope_name += '/'
 
@@ -150,7 +148,7 @@ def _up_sample(X, filters, configs):
     if user_fn is not None:
         return user_fn(X, configs)
 
-    scope_name = tf.get_current_name_scope()
+    scope_name = copy_current_name_scope()
     if scope_name:
         scope_name += '/'
 
@@ -171,7 +169,7 @@ def _output_conv(X, filters, configs):
     user_fn = configs.get_from_class('fn')
     if user_fn is not None:
         return user_fn(X, configs)
-    scope_name = tf.get_current_name_scope()
+    scope_name = copy_current_name_scope()
     if scope_name:
         scope_name += '/'
     X = Conv2D(filters=filters, name=scope_name + 'cn', **configs.get('conv'))(X)
@@ -217,20 +215,21 @@ def build(input_shape, unet_levels=5, init_filters=64, num_classes=1, conv_mode=
 
 
 if __name__ == '__main__':
+    setup = _base_setup(mode='resnet')
     # model_setup = UNET((128, 128, 3))
     # model_setup.change_setup('dbl_conv_encoder', mode='resnet')
-    model = build((128, 128, 3))
-    model.summary()
-    tf.keras.utils.plot_model(
-        model,
-        to_file='model.png',
-        show_shapes=True,
-        show_dtype=False,
-        show_layer_names=True,
-        rankdir='TB',
-        expand_nested=True,
-        dpi=120,
-        layer_range=None,
-        show_layer_activations=True,
-        show_trainable=False
-    )
+    # model = build((128, 128, 3), unet_levels=3)
+    # model.summary()
+    # tf.keras.utils.plot_model(
+    #     model,
+    #     to_file='model.png',
+    #     show_shapes=True,
+    #     show_dtype=False,
+    #     show_layer_names=True,
+    #     rankdir='TB',
+    #     expand_nested=True,
+    #     dpi=120,
+    #     layer_range=None,
+    #     show_layer_activations=True,
+    #     show_trainable=False
+    # )
