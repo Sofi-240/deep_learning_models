@@ -1,22 +1,6 @@
 import tensorflow as tf
-
-
-class Config(dict):
-    def __init__(self, name, configs=None, **kwargs):
-        configs = {} if configs is None else configs
-        super(Config, self).__init__(**configs)
-        self.name = name
-        self.__dict__.update(**kwargs)
-
-    def update_class_dict(self, **kwargs):
-        if 'name' in kwargs.keys():
-            raise ValueError(
-                '"name" is unchangeable value'
-            )
-        self.__dict__.update(**kwargs)
-
-    def get_from_class_dict(self, key):
-        return self.__dict__.get(key)
+from models.configs import copy_layer
+from keras.layers import Activation, BatchNormalization, GroupNormalization
 
 
 def compute_output_shape(
@@ -48,14 +32,33 @@ def compute_output_shape(
     return tf.TensorShape(output_shape)
 
 
-def copy_layer(layer, name=None, include_weights=False):
-    config = layer.get_config()
-    config['name'] = name or config['name'] + '_2'
-    new_layer = type(layer).from_config(config)
+def activation_from_config(config, name=None):
+    act_config = config.get('act')
+    if act_config is None:
+        raise ValueError('activation configs is missing')
+    activation = act_config.get('activation')
+    if issubclass(type(activation), tf.keras.layers.Layer):
+        act_layer = copy_layer(activation, name=name, include_weights=False)
+    else:
+        act_layer = Activation(name=name, **config.get('act', {}))
+    return act_layer
 
-    if layer.built and include_weights:
-        weights = layer.get_weights()
-        new_layer.build(layer.input_shape)
-        new_layer.set_weights(weights)
 
-    return new_layer
+def normalization_from_config(config, name=None):
+    norm_config = config.get('norm')
+    if norm_config is None:
+        raise ValueError('normalization configs is missing')
+    norm = norm_config.get_from_class_dict('norm')
+    if issubclass(type(norm), tf.keras.layers.Layer):
+        norm_layer = copy_layer(norm, name=name, include_weights=False)
+    else:
+        if norm == 'batch':
+            norm_layer = BatchNormalization(name=name, **norm_config)
+        elif norm == 'instance':
+            norm_layer = GroupNormalization(name=name, **norm_config)
+            # instance_normalization == GroupNormalization with groups = feature dim
+        elif norm == 'group':
+            norm_layer = GroupNormalization(name=name, **norm_config)
+        else:
+            norm_layer = None
+    return norm_layer

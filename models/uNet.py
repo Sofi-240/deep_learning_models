@@ -1,87 +1,10 @@
 import tensorflow as tf
 from tensorflow import keras
 from typing import Callable
-from models.utils import copy_layer, Config
-from keras.layers import Conv2D, Activation, BatchNormalization, MaxPooling2D, Dropout, Conv2DTranspose, Identity, \
+from models.configs import copy_layer, Config, base_configs
+from models.utils import activation_from_config, normalization_from_config
+from keras.layers import Conv2D, MaxPooling2D, Dropout, Conv2DTranspose, Identity, \
     concatenate, Resizing, Cropping2D
-
-
-def base_configs(layer_name, **kwargs):
-    if layer_name == 'conv':
-        con = Config(
-            'conv',
-            configs=dict(
-                kernel_size=(3, 3),
-                strides=(1, 1),
-                dilation_rate=(1, 1),
-                padding='same',
-                kernel_initializer='he_normal',
-                bias_initializer='zeros',
-                data_format='channels_last',
-                activation=None,
-                trainable=True
-            )
-        )
-    elif layer_name == 'bn':
-        con = Config(
-            'bn',
-            configs=dict(
-                momentum=0.99,
-                epsilon=0.001,
-                center=True,
-                scale=True,
-                beta_initializer='zeros',
-                gamma_initializer='ones',
-                moving_mean_initializer='zeros',
-                moving_variance_initializer='ones'
-            ),
-            norm='batch'
-        )
-    elif layer_name == 'act':
-        con = Config(
-            'act',
-            configs=dict(
-                activation='relu'
-            )
-        )
-    elif layer_name == 'max_pooling':
-        con = Config(
-            'pool',
-            configs=dict(
-                pool_size=(2, 2),
-                strides=(2, 2),
-                padding='valid',
-                data_format='channels_last'
-            ),
-            mode='max'
-        )
-    elif layer_name == 'dropout':
-        con = Config(
-            'dropout',
-            configs=dict(
-                rate=0.0,
-                noise_shape=None,
-                seed=None
-            )
-        )
-    elif layer_name == 'convT':
-        con = Config(
-            'convT',
-            configs=dict(
-                kernel_size=(2, 2),
-                strides=(2, 2),
-                dilation_rate=(1, 1),
-                padding='valid',
-                kernel_initializer='he_normal',
-                bias_initializer='zeros',
-                data_format='channels_last',
-                trainable=True
-            )
-        )
-    else:
-        con = Config(layer_name, configs={})
-    con.update(**kwargs)
-    return con
 
 
 class UNET:
@@ -91,57 +14,8 @@ class UNET:
         self.init_filters = init_filters
         self.output_dim = num_classes
         self.__setup_base()
-        # TODO: Normalization instance, group abd layer.
+        # TODO: Normalization instance, group abd layer or None.
         # TODO: add validation between the levels and input shape.
-
-    def __setup_base(self):
-        self.dbl_conv_encoder = Config('dbl_conv', block='encoder', fn=None, mode='base')
-        self.dbl_conv_encoder.update(
-            conv=base_configs('conv'),
-            bn=base_configs('bn'),
-            act=base_configs('act'),
-            conv_id=None
-        )
-
-        self.down_sample = Config('down_sample', block='encoder', fn=None)
-        self.down_sample.update(
-            pool=base_configs('max_pooling'),
-            drop=base_configs('dropout')
-        )
-
-        self.dbl_conv_middle = Config('dbl_conv', block='middle', fn=None, mode='base')
-        self.dbl_conv_middle.update(
-            conv=base_configs('conv'),
-            bn=base_configs('bn'),
-            act=base_configs('act')
-        )
-
-        self.up_sample = Config('up_sample', block='decoder', fn=None)
-        self.up_sample.update(
-            convT=base_configs('convT'),
-            drop=base_configs('dropout')
-        )
-
-        self.dbl_conv_decoder = Config('dbl_conv', block='decoder', fn=None, mode='base')
-        self.dbl_conv_decoder.update(
-            conv=base_configs('conv'),
-            bn=base_configs('bn'),
-            act=base_configs('act')
-        )
-
-        self.output_conv = Config('output_conv', block='output', fn=None)
-        self.output_conv.update(
-            conv=base_configs('conv', kernel_size=(1, 1)),
-            act=base_configs('act', activation='softmax')
-        )
-        self.config_names = [
-            'dbl_conv_encoder',
-            'down_sample',
-            'dbl_conv_middle',
-            'up_sample',
-            'dbl_conv_decoder',
-            'output_conv'
-        ]
 
     def build(self, input_shape):
         input_shape = tf.TensorShape(input_shape)
@@ -208,6 +82,55 @@ class UNET:
 
         con.update_class_dict(**kwargs)
 
+    def __setup_base(self):
+        self.dbl_conv_encoder = Config('dbl_conv', block='encoder', fn=None, mode='base')
+        self.dbl_conv_encoder.update(
+            conv=base_configs('conv'),
+            norm=base_configs('norm', config_kw={'norm': 'batch'}),
+            act=base_configs('act'),
+            conv_id=None
+        )
+
+        self.down_sample = Config('down_sample', block='encoder', fn=None)
+        self.down_sample.update(
+            pool=base_configs('pool', config_kw={'pool': 'max'}),
+            drop=base_configs('dropout')
+        )
+
+        self.dbl_conv_middle = Config('dbl_conv', block='middle', fn=None, mode='base')
+        self.dbl_conv_middle.update(
+            conv=base_configs('conv'),
+            norm=base_configs('norm', config_kw={'norm': 'batch'}),
+            act=base_configs('act')
+        )
+
+        self.up_sample = Config('up_sample', block='decoder', fn=None)
+        self.up_sample.update(
+            convT=base_configs('convT'),
+            drop=base_configs('dropout')
+        )
+
+        self.dbl_conv_decoder = Config('dbl_conv', block='decoder', fn=None, mode='base')
+        self.dbl_conv_decoder.update(
+            conv=base_configs('conv'),
+            norm=base_configs('norm', config_kw={'norm': 'batch'}),
+            act=base_configs('act')
+        )
+
+        self.output_conv = Config('output_conv', block='output', fn=None)
+        self.output_conv.update(
+            conv=base_configs('conv', kernel_size=(1, 1)),
+            act=base_configs('act', activation='softmax')
+        )
+        self.config_names = [
+            'dbl_conv_encoder',
+            'down_sample',
+            'dbl_conv_middle',
+            'up_sample',
+            'dbl_conv_decoder',
+            'output_conv'
+        ]
+
     def __double_conv(self, X, filters, configs):
         user_fn = configs.get_from_class_dict('fn')
         if user_fn is not None:
@@ -222,19 +145,11 @@ class UNET:
                     conv3 = Conv2D(filters=filters, name=scope_name + 'cnId', **id_config)
                     X_copy = conv3(X_copy)
 
-            norm1 = BatchNormalization(name=scope_name + 'bn1', **configs.get('bn', {}))
-            norm2 = BatchNormalization(name=scope_name + 'bn2', **configs.get('bn', {}))
+            norm1 = normalization_from_config(configs, name=scope_name + 'norm1')
+            norm2 = copy_layer(norm1, name=scope_name + 'norm2', include_weights=False)
 
-            act_config = configs.get('act')
-            if act_config is None:
-                raise ValueError('activation configs is missing')
-            act_config = act_config.get('activation')
-            if issubclass(type(act_config), tf.keras.layers.Layer):
-                act1 = copy_layer(act_config, name=scope_name + 'act1', include_weights=False)
-                act2 = copy_layer(act_config, name=scope_name + 'act2', include_weights=False)
-            else:
-                act1 = Activation(name=scope_name + 'act1', **configs.get('act', {}))
-                act2 = Activation(name=scope_name + 'act2', **configs.get('act', {}))
+            act1 = activation_from_config(configs, scope_name + 'act1')
+            act2 = copy_layer(act1, name=scope_name + 'act2', include_weights=False)
 
             X = act1(norm1(conv1(X)))
             X = norm2(conv2(X))
@@ -308,14 +223,7 @@ class UNET:
     def __output_conv(self, X, filters, configs):
         with tf.name_scope('output_conv') as scope_name:
             X = Conv2D(filters=filters, name=scope_name + 'cn', **configs.get('conv', {}))(X)
-            act_config = configs.get('act')
-            if act_config is None:
-                raise ValueError('activation configs is missing')
-            act_config = act_config.get('activation')
-            if issubclass(type(act_config), tf.keras.layers.Layer):
-                act = copy_layer(act_config, name=scope_name + 'act', include_weights=False)
-            else:
-                act = Activation(name=scope_name + 'act', **configs.get('act', {}))
+            act = activation_from_config(configs, scope_name + 'act')
             X = act(X)
             return X
 
@@ -325,3 +233,16 @@ if __name__ == '__main__':
     # model_setup.change_setup('dbl_conv_encoder', mode='resnet')
     model = model_setup.build((128, 128, 3))
     model.summary()
+    tf.keras.utils.plot_model(
+        model,
+        to_file='model.png',
+        show_shapes=True,
+        show_dtype=False,
+        show_layer_names=True,
+        rankdir='TB',
+        expand_nested=True,
+        dpi=120,
+        layer_range=None,
+        show_layer_activations=True,
+        show_trainable=False
+    )
