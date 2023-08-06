@@ -42,13 +42,11 @@ class BaseConfiguration:
         configs = dict(
             kernel_size=(3, 3),
             strides=(1, 1),
-            dilation_rate=(1, 1),
             padding='same',
             kernel_initializer='he_normal',
             bias_initializer='zeros',
             data_format='channels_last',
             activation=None,
-            activity_regularizer=None,
             trainable=True
         )
         configs.update(**layer_kw)

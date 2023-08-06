@@ -40,7 +40,7 @@ def _base_setup(N_layers: int, bottleneck: bool = False):
 
     resnet_setup['output_block'] = Config('output_block')
     resnet_setup['output_block'].update(
-        pool=base_config('pool', call_name='pool', mode='max', layer_kw=dict(pool_size=(7, 7), padding='same')),
+        pool=base_config('pool', call_name='pool', mode='max', layer_kw=dict(pool_size=(7, 7), strides=(1, 1))),
         dense=base_config('dense',
                           call_name='dense',
                           layer_kw=dict(
@@ -97,9 +97,14 @@ def __block_ex(inputs, filters, configs, down_sample=True):
     return residual_block(inputs, filters, configs, down_sample=down_sample)
 
 
-def residual_block(inputs, filters, configs, down_sample=True):
+def residual_block(
+        inputs: tf.Tensor,
+        filters: int,
+        configs: Union[dict[Union[dict, Config]], Config],
+        down_sample: bool = True):
     scope_name = copy_current_name_scope()
     shape = inputs.get_shape()
+
     conv1 = Conv2D(filters=filters, name=scope_name + 'cn1', **configs.get('conv'))
     if down_sample:
         conv1.strides = (2, 2)
@@ -128,7 +133,11 @@ def residual_block(inputs, filters, configs, down_sample=True):
     return X
 
 
-def bottleneck_block(inputs, filters, configs, down_sample=True):
+def bottleneck_block(
+        inputs: tf.Tensor,
+        filters: int,
+        configs: Union[dict[Union[dict, Config]], Config],
+        down_sample: bool = True):
     scope_name = copy_current_name_scope()
 
     conv1 = Conv2D(filters=filters, name=scope_name + 'cn1', **configs.get('conv'))
@@ -206,18 +215,19 @@ def ResNetModel(
 
 
 if __name__ == '__main__':
+    setup = _base_setup(18)
     model = ResNetModel(tf.TensorShape((224, 224, 3)), N_layers=18)
     model.summary()
-    tf.keras.utils.plot_model(
-        model,
-        to_file='model.png',
-        show_shapes=True,
-        show_dtype=False,
-        show_layer_names=True,
-        rankdir='TB',
-        expand_nested=True,
-        dpi=120,
-        layer_range=None,
-        show_layer_activations=True,
-        show_trainable=False
-    )
+    # tf.keras.utils.plot_model(
+    #     model,
+    #     to_file='model.png',
+    #     show_shapes=True,
+    #     show_dtype=False,
+    #     show_layer_names=True,
+    #     rankdir='TB',
+    #     expand_nested=True,
+    #     dpi=120,
+    #     layer_range=None,
+    #     show_layer_activations=True,
+    #     show_trainable=False
+    # )
