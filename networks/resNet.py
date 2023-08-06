@@ -1,10 +1,10 @@
 import tensorflow as tf
 from tensorflow import keras
 from typing import Union
-from networks.configs import copy_layer, BlockConfig
+from networks.configs import copy_layer, Config, base_config
 from keras.layers import Conv2D, MaxPooling2D, Flatten, Add, AveragePooling2D, Dense
 from networks.utils import activation_from_config, normalization_from_config, copy_current_name_scope
-from collections import namedtuple
+
 
 def _base_setup(N_layers: int, bottleneck: bool = False):
     default = {
@@ -18,68 +18,40 @@ def _base_setup(N_layers: int, bottleneck: bool = False):
     bottleneck = True if N_layers >= 50 else bottleneck
     if conv_rep is None:
         raise ValueError('Number of layers can be 18, 34, 50, 101, 152')
+    resnet_setup = Config('resnet_setup')
 
-    #  conv1 layer: conv7x7, bn, activation, max pooling
-    # _____________________________________________________________________________
-    conv1 = BlockConfig(
-        'conv1', block='input'
-    )
-    conv1.add_layer_config(
-        'conv', from_base=True, call_name='conv2d', layer_kw=dict(kernel_size=(7, 7), strides=(2, 2))
-    )
-    conv1.add_layer_config(
-        'norm', from_base=True, call_name='normalization', norm='batch'
-    )
-    conv1.add_layer_config(
-        'act', from_base=True, call_name='activation'
+    conv1 = Config('conv1')
+    conv1.update(
+        conv=base_config('conv', call_name='conv2d', layer_kw=dict(kernel_size=(7, 7), strides=(2, 2))),
+        norm=base_config('norm', call_name='normalization', norm='batch'),
+        act=base_config('act', call_name='activation'),
+        pool=base_config('pool', call_name='pool', mode='max',
+                         layer_kw=dict(pool_size=(3, 3), padding='same', strides=(2, 2)))
     )
 
-    conv1.add_layer_config('pool', from_base=True, call_name='pool', mode='max',
-                           layer_kw=dict(pool_size=(3, 3), padding='same', strides=(2, 2)))
-
-    #  middle layers convN_x: conv2_x, conv3_x, conv4_x, conv5_x
-    # _____________________________________________________________________________
-    convN_x = BlockConfig(
-        'convN_x', block='middle', rep=conv_rep, bottleneck=bottleneck
-    )
-    convN_x.add_layer_config(
-        'conv', from_base=True, call_name='conv2d'
-    )
-    convN_x.add_layer_config(
-        'convID', from_base=True, call_name='conv2d', layer_kw=dict(kernel_size=(1, 1))
-    )
-    convN_x.add_layer_config(
-        'norm', from_base=True, call_name='normalization', norm='batch'
-    )
-    convN_x.add_layer_config(
-        'act', from_base=True, call_name='activation'
+    resnet_setup['conv1'] = conv1
+    resnet_setup['convN_x'] = Config('convN_x', rep=conv_rep, bottleneck=bottleneck)
+    resnet_setup['convN_x'].update(
+        conv=base_config('conv', call_name='conv2d', layer_kw=dict(kernel_size=(3, 3))),
+        convID=base_config('conv', call_name='conv2d', layer_kw=dict(kernel_size=(1, 1))),
+        norm=base_config('norm', call_name='normalization', norm='batch'),
+        act=base_config('act', call_name='activation'),
     )
 
-    #  output block: avg pooling, fc, activation
-    # _____________________________________________________________________________
-    output_block = BlockConfig(
-        'output_block', block='output'
+    resnet_setup['output_block'] = Config('output_block')
+    resnet_setup['output_block'].update(
+        pool=base_config('pool', call_name='pool', mode='max', layer_kw=dict(pool_size=(7, 7), padding='same')),
+        dense=base_config('dense',
+                          call_name='dense',
+                          layer_kw=dict(
+                              kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0., stddev=.01),
+                              bias_initializer=tf.keras.initializers.zeros(),
+                              kernel_regularizer=tf.keras.regularizers.L2(.01)
+                          )
+                          ),
+        act=base_config('act', call_name='activation', layer_kw=dict(activation='softmax')),
     )
-    output_block.add_layer_config(
-        'pool', from_base=True, call_name='pool', mode='avg', layer_kw=dict(pool_size=(7, 7), padding='same')
-    )
-    output_block.add_layer_config(
-        'dense', from_base=True, call_name='dense',
-        layer_kw=dict(
-            kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0., stddev=.01),
-            bias_initializer=tf.keras.initializers.zeros(),
-            kernel_regularizer=tf.keras.regularizers.L2(.01))
-    )
-    output_block.add_layer_config(
-        'act', from_base=True, call_name='activation', layer_kw=dict(activation='softmax')
-    )
-
-    resnet_config = dict(
-        conv1=conv1,
-        convN_x=convN_x,
-        output_block=output_block
-    )
-    return resnet_config
+    return resnet_setup
 
 
 def __conv1(X, filters, configs):
@@ -136,7 +108,7 @@ def residual_block(inputs, filters, configs, down_sample=True):
     if down_sample or shape[-1] != filters:
         id_configs = configs.get('convID')
         if id_configs is None:
-            id_configs = configs.get_layer_config('conv', kernel_size=(1, 1))
+            id_configs = configs['conv'].deepcopy(name='convID', kernel_size=(1, 1))
         conv_id = Conv2D(filters=filters, name=scope_name + 'cnID', **id_configs)
         conv_id.strides = conv1.strides
         X_copy = conv_id(inputs)
@@ -234,20 +206,18 @@ def ResNetModel(
 
 
 if __name__ == '__main__':
-    config = _base_setup(18)
-    user_config = namedtuple('user_config', config.keys())(**config)
-    # model = ResNetModel(tf.TensorShape((224, 224, 3)), N_layers=18, bottleneck=True)
-    # model.summary()
-    # tf.keras.utils.plot_model(
-    #     model,
-    #     to_file='model.png',
-    #     show_shapes=True,
-    #     show_dtype=False,
-    #     show_layer_names=True,
-    #     rankdir='TB',
-    #     expand_nested=True,
-    #     dpi=120,
-    #     layer_range=None,
-    #     show_layer_activations=True,
-    #     show_trainable=False
-    # )
+    model = ResNetModel(tf.TensorShape((224, 224, 3)), N_layers=18)
+    model.summary()
+    tf.keras.utils.plot_model(
+        model,
+        to_file='model.png',
+        show_shapes=True,
+        show_dtype=False,
+        show_layer_names=True,
+        rankdir='TB',
+        expand_nested=True,
+        dpi=120,
+        layer_range=None,
+        show_layer_activations=True,
+        show_trainable=False
+    )

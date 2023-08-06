@@ -1,5 +1,4 @@
 from typing import Union
-
 import tensorflow as tf
 from keras.layers import Activation, BatchNormalization, GroupNormalization, Cropping2D, Resizing
 from networks.configs import copy_layer
