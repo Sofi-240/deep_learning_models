@@ -51,16 +51,21 @@ def __double_conv(inputs, filters, configs):
     if user_fn is not None:
         return user_fn(inputs, filters, configs)
 
+    shape = inputs.get_shape()
     scope_name = copy_current_name_scope()
 
     conv1 = Conv2D(filters=filters, name=scope_name + 'cn1', **configs.get('conv'))
     conv2 = Conv2D(filters=filters, name=scope_name + 'cn2', **configs.get('conv'))
 
     X_copy = None
-    if configs.mode == 'resnet':
-        id_config = configs.get('convID', {})
-        if id_config:
-            X_copy = Conv2D(filters=filters, name=scope_name + 'cnId', **id_config)(inputs)
+    mode = configs.get_from_class('mode', 'base')
+    if mode == 'resnet':
+        id_configs = configs.get('convID')
+        if id_configs is not None or shape[-1] != filters:
+            if id_configs is None:
+                id_configs = configs.get_layer_config('conv', kernel_size=(1, 1))
+            X_copy = Conv2D(filters=filters, name=scope_name + 'cnID', **id_configs)(inputs)
+            X_copy = normalization_from_config(configs, name=scope_name + 'normID')(X_copy)
 
     norm1 = normalization_from_config(configs, name=scope_name + 'norm1')
     norm2 = copy_layer(norm1, name=scope_name + 'norm2', include_weights=False)
@@ -70,7 +75,7 @@ def __double_conv(inputs, filters, configs):
 
     X = act1(norm1(conv1(inputs)))
     X = norm2(conv2(X))
-    if configs.mode == 'resnet':
+    if mode == 'resnet':
         X = Add(name=scope_name + 'add')((X, X_copy if X_copy is not None else inputs))
     X = act2(X)
     return X
@@ -179,8 +184,11 @@ class UnetSetup:
                 raise ValueError('costume function need to be callable')
             con.update_class(**kwargs)
 
-    def build_model(self):
-        pass
+    def build_model(self, input_shape):
+        return UnetModel(
+            input_shape,
+            unet_setup=self
+        )
 
 
 def UnetModel(
@@ -189,13 +197,22 @@ def UnetModel(
         init_filters: int = 64,
         num_classes: int = 1,
         conv_mode: str = 'base',
-        name: Union[None, str] = None):
+        name: Union[None, str] = None,
+        unet_setup: Union[None, UnetSetup] = None):
+    setup = None
+    if unet_setup is not None:
+        unet_levels = unet_setup.unet_levels
+        init_filters = unet_setup.init_filters
+        num_classes = unet_setup.output_dim
+        name = unet_setup.name
+        setup = unet_setup.config
 
     input_shape = tf.TensorShape(input_shape)
     input_shape.assert_has_rank(3)
     assert unet_levels >= 2 and init_filters >= 0 and num_classes >= 0
 
-    setup = _base_setup(mode=conv_mode)
+    if setup is None:
+        setup = _base_setup(mode=conv_mode)
 
     filters = tf.cast(init_filters, dtype=tf.int32)
     identity_map = []
@@ -230,10 +247,11 @@ def UnetModel(
 
 
 if __name__ == '__main__':
-    # model_setup = UnetSetup()
+    model_setup = UnetSetup(unet_levels=3)
     # model_setup.change_setup(mode='resnet')
-    model = UnetModel(tf.TensorShape((128, 128, 3)), unet_levels=3)
-    # model.summary()
+    model = model_setup.build_model(tf.TensorShape((128, 128, 3)))
+    # model = UnetModel(tf.TensorShape((128, 128, 3)), unet_levels=3)
+    model.summary()
     # tf.keras.utils.plot_model(
     #     model,
     #     to_file='model.png',

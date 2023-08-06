@@ -1,6 +1,6 @@
 import inspect
 from typing import Union
-
+import copy as COPY
 import tensorflow as tf
 
 
@@ -11,10 +11,7 @@ class Config(dict):
         self.__dict__.update(**kwargs)
 
     def update_class(self, **kwargs):
-        if 'name' in kwargs.keys():
-            raise ValueError(
-                '"name" is unchangeable value'
-            )
+        # TODO: change to __setattr__
         self.__dict__.update(**kwargs)
 
     def get_from_class(self, key: str, default=None):
@@ -152,6 +149,21 @@ class BlockConfig(Config):
     def del_layer(self, name: str):
         self.pop(name)
 
+    def get_layer_config(self, name: str, **update_kw):
+        con = self.get(name)
+        if con is None:
+            raise KeyError(f'unknown layer {name}')
+        ret = dict(con)
+        if not update_kw:
+            return ret
+        ret.update(**update_kw)
+        return ret
+
+    def deepcopy(self, **class_kw):
+        self_copy = COPY.deepcopy(self)
+        self_copy.update_class(**class_kw)
+        return self_copy
+
 
 def copy_layer(layer,
                name: Union[None, str] = None,
@@ -169,3 +181,31 @@ def copy_layer(layer,
         new_layer.set_weights(weights)
 
     return new_layer
+
+
+if __name__ == '__main__':
+    # check block config
+    block = BlockConfig('block', class_val=10)
+    block.add_layer_config(
+        'conv', from_base=True, call_name='conv2d', layer_kw=dict(padding='valid'), conv_class_val=50
+    )
+    assert block['conv']['padding'] == 'valid'
+
+    conv_configs = block.get_layer_config('conv')
+    assert conv_configs['padding'] == 'valid'
+
+    conv_configs = block.get_layer_config('conv', padding='same')
+
+    assert conv_configs['padding'] == 'same' and block['conv']['padding'] == 'valid'
+
+    block.update_layer_config('conv', kernel_size=(5, 5))
+
+    assert conv_configs['kernel_size'][0] == 3 and block['conv']['kernel_size'][0] == 5
+
+    block.update_layer_class('conv', conv_class_val=100)
+
+    assert block['conv'].get_from_class('conv_class_val') == 100
+
+    block.update_class(class_val=50)
+
+    assert block.get_from_class('class_val') == 50
