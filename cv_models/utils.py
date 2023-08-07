@@ -77,31 +77,3 @@ def clip_to_shape(X, shape, **kwargs):
 
     return tf.pad(X, paddings, **kwargs)
 
-
-def make_neighbor(cords, con=3):
-    ax = tf.range(-con // 2 + 1, (con // 2) + 1, dtype=tf.int64)
-    con_kernel = tf.stack(tf.meshgrid(ax, ax, ax), axis=-1)
-    con_kernel = tf.reshape(con_kernel, shape=(1, con ** 3, 3))
-    _, H, W, D = p.shape
-
-    b, yxd = tf.split(C, [1, 3], axis=1)
-    yxd = yxd[:, tf.newaxis, ...]
-
-    yxd = yxd + con_kernel
-
-    b = tf.repeat(b[:, tf.newaxis, ...], repeats=con ** 3, axis=1)
-
-    y, x, d = tf.split(yxd, [1, 1, 1], axis=-1)
-
-    def cast(arr, max_val, diff=0):
-        arr = tf.reshape(arr, shape=(-1,))
-        arr = tf.where(tf.math.greater(arr, max_val - diff), max_val - diff, arr)
-        arr = tf.where(tf.math.less(arr, diff), diff, arr)
-        arr = tf.reshape(arr, shape=(-1, con ** 3, 1))
-        return arr
-
-    y = cast(y, H, 5)
-    x = cast(x, W, 5)
-    d = cast(d, D, 1)
-
-    neighbor = tf.concat((b, y, x, d), axis=-1)
