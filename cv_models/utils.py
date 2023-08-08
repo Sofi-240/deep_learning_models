@@ -6,7 +6,10 @@ PI = tf.cast(
 )
 
 
-def gaussian_kernel(kernel_size, sigma=None):
+def gaussian_kernel(
+        kernel_size: int,
+        sigma: Union[None, float] = None
+) -> tf.Tensor:
     if kernel_size == 0 and (sigma is None or sigma < 0.8):
         raise ValueError('minimum kernel need to be size of 3')
 
@@ -28,23 +31,11 @@ def gaussian_kernel(kernel_size, sigma=None):
     return kernel / tf.reduce_sum(kernel)
 
 
-def pad(X, b=None, h=None, w=None, d=None, **kwargs):
-    n_dim = len(X.get_shape())
-    assert n_dim == 4
-    if not b and not h and not w and not d: return X
-    paddings = []
-    for arg in [b, h, w, d]:
-        arg = int(arg) if arg is not None else [0, 0]
-        arg = [arg, arg] if issubclass(type(arg), int) else list(arg)
-        paddings.append(arg)
-
-    paddings = tf.constant(paddings, dtype=tf.int32)
-
-    padded = tf.pad(X, paddings, **kwargs)
-    return padded
-
-
-def clip_to_shape(X, shape, **kwargs):
+def clip_to_shape(
+        X: tf.Tensor,
+        shape: Union[tf.Tensor, list, tuple],
+        **kwargs
+) -> tf.Tensor:
     shape_ = X.get_shape()
     n_dim_ = len(shape_)
 
@@ -82,7 +73,8 @@ def clip_to_shape(X, shape, **kwargs):
 def make_neighborhood3D(
         init_cords: tf.Tensor,
         con: int = 3,
-        origin_shape: Union[None, tuple, list, tf.TensorShape] = None):
+        origin_shape: Union[None, tuple, list, tf.TensorShape] = None
+) -> tf.Tensor:
     B, ndim = init_cords.get_shape()
 
     assert ndim == 4
@@ -105,33 +97,46 @@ def make_neighborhood3D(
         return neighbor
 
     assert len(origin_shape) == 4
+    neighbor = neighbor + 1
+    b, y, x, d = tf.unstack(neighbor, num=4, axis=-1)
 
-    neighbor = tf.reshape(neighbor, shape=(-1, 4))
-    neighbor = cast_cords(neighbor, origin_shape)
-    return tf.reshape(neighbor, shape=(-1, con ** 3, 4))
+    y_cast = tf.logical_and(tf.math.greater_equal(y, 1), tf.math.less_equal(y, origin_shape[1]))
+    x_cast = tf.logical_and(tf.math.greater_equal(x, 1), tf.math.less_equal(x, origin_shape[2]))
+    d_cast = tf.logical_and(tf.math.greater_equal(d, 1), tf.math.less_equal(d, origin_shape[3]))
+
+    valid = tf.cast(tf.logical_and(tf.logical_and(y_cast, x_cast), d_cast), dtype=tf.int32)
+    valid = tf.math.reduce_prod(valid, axis=-1)
+    cords_valid = tf.where(valid == 1)
+    neighbor = tf.gather_nd(neighbor, cords_valid) - 1
+    return neighbor
 
 
-def cast_cords(cords, shape):
+def cast_cords(
+        cords: tf.Tensor,
+        shape: Union[tf.Tensor, list, tuple]
+) -> tf.Tensor:
     cords_shape_ = cords.get_shape()
     assert len(cords_shape_) == 2
     assert cords_shape_[1] == len(shape)
 
     def cast(arr, min_val, max_val):
-        arr = tf.reshape(arr, shape=(-1,))
-        arr = tf.where(tf.math.greater(arr, max_val), -1, arr)
-        arr = tf.where(tf.math.less(arr, min_val), -1, arr)
-        return arr
+        return tf.logical_and(tf.math.greater_equal(arr, min_val), tf.math.less_equal(arr, max_val))
 
-    cords_unstack = tf.split(cords, [1] * len(shape), axis=-1)
-    masked_cords = [cast(cords_unstack[c + 1], 0, shape[c + 1] - 1) for c in range(len(shape) - 1)]
-    masked_cords = [tf.reshape(cords_unstack[0], shape=(-1, ))] + masked_cords
+    cords_unstack = tf.unstack(cords, num=4, axis=-1)
+    masked_cords = [cast(cords_unstack[c], 0, shape[c] - 1) for c in range(1, len(shape))]
 
     casted_ = tf.ones(shape=masked_cords[0].shape, dtype=tf.bool)
-
-    for i in range(1, len(shape)):
-        casted_ = tf.math.logical_and(casted_, masked_cords[i] > 0)
+    for mask in masked_cords:
+        casted_ = tf.math.logical_and(casted_, mask)
 
     casted_ = tf.where(casted_)
-
-    ret = tf.concat([tf.reshape(tf.gather(c, casted_), (casted_.shape[0], 1)) for c in masked_cords], axis=-1)
+    ret = tf.concat([tf.reshape(tf.gather(c, casted_), (casted_.shape[0], 1)) for c in cords_unstack], axis=-1)
     return ret
+
+
+if __name__ == '__main__':
+    case1 = tf.ones(shape=(1, 3, 3, 3), dtype=tf.float32)
+
+    cords_case1 = tf.where(tf.equal(case1, 1.0))
+    neighbor1 = make_neighborhood3D(init_cords=cords_case1, con=3, origin_shape=(1, 3, 3, 3))
+    assert neighbor1.shape[0] == 1

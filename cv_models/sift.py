@@ -1,10 +1,12 @@
 from typing import Union
 import tensorflow as tf
 from cv_models.utils import PI, gaussian_kernel, clip_to_shape, make_neighborhood3D, cast_cords
-from viz import show_images
-import numpy as np
+from tensorflow.python.keras import backend
 
 math = tf.math
+linalg = tf.linalg
+
+backend.set_floatx('float32')
 
 # https://www.cs.ubc.ca/~lowe/papers/ijcv04.pdf
 
@@ -14,18 +16,182 @@ INTERVALS = 3
 BORDER_WIDTH = 5
 CONTRAST_THRESHOLD = 0.04
 CON = 3
+N_ATTEMPTS = 5
+EXTREMA_OFFSET = .5
+EIGEN_RATIO = 10
+DTYPE = tf.float32
+THRESHOLD = tf.floor(0.5 * CONTRAST_THRESHOLD / 3.0 * 255.0)
 
 
 class KeyPoint:
-    def __init__(self):
-        self.pt = None
-        self.octave = None
-        self.size = None
-        self.response = None
+    """for now...."""
+
+    def __init__(self, octave_master, extrema, coordinates, response):
+        gaussian_images = octave_master.gaussian_images
+        octave_index = octave_master.index
+
+        self.response = tf.abs(response)
+
+        self.octave_index = tf.cast(octave_index, dtype=tf.int32)
+
+        ex, ey, ez = tf.unstack(extrema, num=3, axis=1)
+        cb, cy, cx, cz = tf.unstack(tf.cast(coordinates, dtype=tf.float32), num=4, axis=1)
+
+        self.pt = (cb, (cy + ey) * (2 ** octave_index), (cx + ex) * (2 ** octave_index))
+        self.octave = octave_index + (cz * (2 ** 8)) + tf.round((ez + 0.5) * 255) * (2 ** 16)
+        self.size = SIGMA * (2 ** ((cz + ez) / tf.cast(INTERVALS, dtype=tf.float32))) * (2 ** (octave_index + 1))
+        self.local_image_index = tf.cast(cz, dtype=tf.int32)
+        self.local_image_index_uni = tf.unique(self.local_image_index)
+        self.gaussian_images = tf.gather(gaussian_images, self.local_image_index_uni[0], axis=-1)
+
+    def __len__(self):
+        return self.local_image_index.shape[0]
 
 
-def gaussian_bluer(X: tf.Tensor,
-                   sigma: Union[tf.Tensor, float]):
+class Octave:
+    def __init__(self,
+                 index: int,
+                 base_X: tf.Tensor,
+                 gaussian_images: tf.Tensor,
+                 dog_images: tf.Tensor,
+                 init_extrema: tf.Tensor):
+        self.index_ = index
+        self.base_X = base_X
+        self.gaussian_images = gaussian_images
+        self.dog_images = dog_images
+        self.init_extrema = init_extrema
+
+    @property
+    def index(self) -> tf.Tensor:
+        return tf.cast(self.index_, dtype=DTYPE)
+
+    def __split_cond(
+            self,
+            extrema: tf.Tensor,
+            current_cords: tf.Tensor
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        shape_ = extrema.get_shape()
+        assert shape_[-1] == 3
+        assert len(shape_) == 2
+
+        ex, ey, ez = tf.unstack(extrema, num=3, axis=1)
+        cond = math.logical_and(
+            math.logical_and(tf.abs(ex) < EXTREMA_OFFSET, tf.abs(ey) < EXTREMA_OFFSET),
+            tf.abs(ez) < EXTREMA_OFFSET
+        )
+
+        cond_by_index = tf.where(cond == False)
+
+        positions_shift = tf.gather_nd(
+            tf.stack((ey, ex, ez), axis=-1), cond_by_index
+        )
+        if positions_shift.shape[0] == 0:
+            return None, tf.where(cond == True)
+
+        next_middle_pixel_cords = tf.gather_nd(current_cords, cond_by_index)
+
+        positions_shift = tf.pad(
+            positions_shift, paddings=tf.constant([[0, 0], [1, 0]], dtype=tf.int32), constant_values=0
+        )
+        next_middle_pixel_cords = next_middle_pixel_cords + tf.cast(tf.round(positions_shift), dtype=tf.int64)
+        next_middle_pixel_cords = cast_cords(next_middle_pixel_cords, shape=self.dog_images.shape)
+
+        maby_key_point_cords = tf.where(cond == True)
+
+        return next_middle_pixel_cords, maby_key_point_cords
+
+    def __localize_extrema(
+            self,
+            current_middle_pixel: tf.Tensor
+    ) -> tuple[tf.Tensor, Union[KeyPoint, None]]:
+        # 3x3x3 cube
+        neighbor = make_neighborhood3D(current_middle_pixel, con=CON, origin_shape=self.dog_images.shape)
+        neighbor = tf.reshape(neighbor, shape=(-1, 4))
+
+        neighbor_values = tf.gather_nd(self.dog_images, neighbor) / 255.0
+        neighbor_values = tf.reshape(neighbor_values, (-1, CON, CON, CON))
+
+        gradient = compute_gradient_xyz(neighbor_values)
+        hessian = compute_hessian_xyz(neighbor_values)
+        extrema_updates = - tf.linalg.lstsq(hessian, gradient, l2_regularizer=0.0, fast=False)
+        extrema_updates = tf.reshape(extrema_updates, (-1, 3))
+
+        next_middle_pixel_cords, maby_key_point_cords = self.__split_cond(extrema_updates, current_middle_pixel)
+
+        # check the key points
+        gradient = tf.gather_nd(gradient, maby_key_point_cords)
+        hessian = tf.gather_nd(hessian, maby_key_point_cords)
+        extrema_updates = tf.gather_nd(extrema_updates, maby_key_point_cords)
+        middle_pixel_values = tf.gather_nd(neighbor_values, maby_key_point_cords)
+        middle_pixel_values = middle_pixel_values[:, 1, 1, 1]
+        middle_pixel_cords = tf.gather_nd(current_middle_pixel, maby_key_point_cords)
+
+        dot = tf.reduce_sum(
+            tf.multiply(
+                extrema_updates[:, tf.newaxis, tf.newaxis, ...],
+                tf.transpose(gradient, perm=(0, 2, 1))[:, tf.newaxis, ...]
+            ),
+            axis=-1, keepdims=False
+        )
+        dot = tf.reshape(dot, shape=(-1,))
+        functionValue = middle_pixel_values + 0.5 * dot
+
+        mask_for_key_points = math.greater_equal(
+            math.abs(functionValue) * INTERVALS, CONTRAST_THRESHOLD
+        )
+
+        xy_hess = hessian[:, :2, :2]
+        xy_hess_trace = tf.linalg.trace(xy_hess)
+        xy_hess_det = tf.linalg.det(xy_hess)
+
+        sure_key_points = math.logical_and(
+            math.logical_and(
+                xy_hess_det > 0,
+                math.less(EIGEN_RATIO * (xy_hess_trace ** 2), ((EIGEN_RATIO + 1) ** 2) * xy_hess_det)
+            ), mask_for_key_points
+        )
+
+        sure_key_points_cords = tf.where(sure_key_points == True)
+
+        if sure_key_points_cords.shape[0] == 0:
+            return next_middle_pixel_cords, None
+
+        kp_extrema = tf.gather_nd(extrema_updates, sure_key_points_cords)
+        kp_cords = tf.gather_nd(middle_pixel_cords, sure_key_points_cords)
+        kp_functionValue = tf.gather_nd(functionValue, sure_key_points_cords)
+
+        kp = KeyPoint(octave_master=self, extrema=kp_extrema, coordinates=kp_cords, response=kp_functionValue)
+
+        return next_middle_pixel_cords, kp
+
+    def __call__(
+            self,
+            iterations: Union[None, int] = None
+    ) -> list[KeyPoint, ...]:
+
+        iterations = iterations if iterations is not None else N_ATTEMPTS
+        current_middle_pixel = self.init_extrema
+        keyPoints = []
+
+        for _ in tf.range(iterations):
+            if current_middle_pixel is None:
+                break
+            current_middle_pixel, kp = self.__localize_extrema(current_middle_pixel)
+            if kp is not None:
+                keyPoints.append(kp)
+        return keyPoints
+
+
+def gaussian_blur(
+        X: tf.Tensor,
+        sigma: Union[tf.Tensor, float]
+) -> tf.Tensor:
+    shape_ = X.get_shape()
+    n_dim_ = len(shape_)
+    assert n_dim_ == 4
+    b, h, w, d = shape_
+    assert d == 1
+
     kernel = gaussian_kernel(kernel_size=0, sigma=sigma)
     kernel_size = kernel.shape[0]
     kernel = tf.reshape(kernel, shape=(kernel_size, kernel_size, 1, 1), name='kernel')
@@ -38,10 +204,11 @@ def gaussian_bluer(X: tf.Tensor,
     return Xg
 
 
-def base_image(
+def blur_base_image(
         image: tf.Tensor,
         sigma: Union[tf.Tensor, float],
-        assume_blur: Union[tf.Tensor, float] = .5):
+        assume_blur: Union[tf.Tensor, float] = .5
+) -> tf.Tensor:
     shape_ = image.get_shape()
     n_dim_ = len(shape_)
     assert n_dim_ == 4
@@ -55,34 +222,25 @@ def base_image(
 
     delta_sigma = (sigma ** 2) - ((2 * assume_blur) ** 2)
     delta_sigma = math.sqrt(tf.maximum(delta_sigma, 0.64))
-    return gaussian_bluer(X, sigma=delta_sigma)
+    return gaussian_blur(X, sigma=delta_sigma)
 
 
-def n_octaves(image_shape, min_shape=0.0):
-    assert len(image_shape) == 4
-    b, h, w, d = image_shape
-
-    s_ = float(min([h, w]))
-    diff = math.log(s_)
-    if min_shape > 1.0:
-        diff = diff - math.log(tf.cast(min_shape, tf.float32))
-
-    num_octaves = tf.round(diff / math.log(2.0)) + 1
-    return tf.cast(num_octaves, tf.int32)
-
-
-def intervals_kernels(sigma, intervals):
+def intervals_kernels(
+        sigma: Union[tf.Tensor, float],
+        intervals: Union[tf.Tensor, float]
+) -> tf.Tensor:
     images_per_octaves = intervals + 3
+    kernels_n = images_per_octaves - 1
     K = 2 ** (1 / intervals)
     sigma = tf.cast(sigma, dtype=tf.float32)
 
     sigma_prev = (K ** (tf.cast(tf.range(1, images_per_octaves), dtype=tf.float32) - 1.0)) * sigma
     sigmas = math.sqrt((K * sigma_prev) ** 2 - sigma_prev ** 2)
 
-    sigmas = tf.concat((tf.reshape(sigma, shape=(1,)), sigmas), axis=0)
+    # sigmas = tf.concat((tf.reshape(sigma, shape=(1,)), sigmas), axis=0)
 
     kernels = gaussian_kernel(kernel_size=0, sigma=sigmas[-1])
-    paddings = tf.constant([[0, 0], [0, 0], [images_per_octaves - 1, 0]], dtype=tf.int32)
+    paddings = tf.constant([[0, 0], [0, 0], [kernels_n - 1, 0]], dtype=tf.int32)
     kernels = tf.pad(kernels[..., tf.newaxis], paddings, constant_values=0.0)
 
     h, w, _ = kernels.shape
@@ -93,7 +251,9 @@ def intervals_kernels(sigma, intervals):
     for s in tf.range(images_per_octaves - 1):
         temp_kernel = gaussian_kernel(kernel_size=0, sigma=sigmas[s])
         curr_indices = tf.pad(
-            con_indices, tf.constant([[0, 0], [0, 1]], dtype=tf.int32), constant_values=tf.cast(s, dtype=tf.int32)
+            con_indices,
+            tf.constant([[0, 0], [0, 1]], dtype=tf.int32),
+            constant_values=tf.cast(s, dtype=tf.int32)
         )
         temp_kernel = clip_to_shape(temp_kernel, [h, w], constant_values=0.0)
         temp_kernel = tf.reshape(temp_kernel, (-1,))
@@ -102,76 +262,25 @@ def intervals_kernels(sigma, intervals):
     return kernels
 
 
-def scale_space_pyramid(image, num_octaves, kernels, border_width=5, contrast_threshold=0.04):
-    shape_ = image.get_shape()
-    n_dim_ = len(shape_)
-    assert n_dim_ == 4
-    assert shape_[-1] == 1
+def compute_default_N_octaves(
+        image_shape: Union[tf.Tensor, list, tuple],
+        min_shape: int = 0
+) -> tf.Tensor:
+    assert len(image_shape) == 4
+    b, h, w, d = image_shape
 
-    threshold = tf.floor(0.5 * contrast_threshold / 3.0 * 255.0)
+    s_ = float(min([h, w]))
+    diff = math.log(s_)
+    if min_shape > 1:
+        diff = diff - math.log(tf.cast(min_shape, tf.float32))
 
-    def extrema(p):
-        _, H, W, D = p.shape
-        p_pad = tf.pad(p, tf.constant([[0, 0], [1, 1], [1, 1], [0, 0]], dtype=tf.int32), constant_values=0.0)
-        p_pad = tf.transpose(p_pad, perm=(0, 3, 1, 2))
-        p_pad = tf.expand_dims(p_pad, axis=-1)
-        p_pad = math.abs(p_pad)
-
-        max_pooling = tf.nn.max_pool3d(p_pad, (3, 3, 3), (1, 1, 1), 'VALID', data_format='NDHWC', name=None)
-        max_pooling = tf.squeeze(max_pooling, axis=-1)
-        max_pooling = tf.transpose(max_pooling, perm=(0, 2, 3, 1))
-        max_pooling = tf.pad(max_pooling, tf.constant([[0, 0], [0, 0], [0, 0], [1, 1]], dtype=tf.int32),
-                             constant_values=0.0)
-
-        byxd = tf.where(math.logical_and(math.equal(max_pooling, tf.abs(p)), math.greater(tf.abs(p), threshold)))
-
-        b, y, x, d = tf.split(byxd, [1, 1, 1, 1], axis=-1)
-
-        def cast(arr, max_val, diff=0):
-            arr = tf.reshape(arr, shape=(-1,))
-            arr = tf.where(tf.math.greater(arr, max_val - diff), -1, arr)
-            arr = tf.where(tf.math.less(arr, diff), -1, arr)
-            return arr
-
-        y = cast(y, H - 1, border_width)
-        x = cast(x, W - 1, border_width)
-        b = tf.reshape(b, shape=(-1,))
-        d = tf.reshape(d, shape=(-1,))
-
-        casted_ = tf.where(math.logical_and(math.logical_and(x > 0, y > 0), d > 0))
-
-        byxd = tf.concat([tf.reshape(tf.gather(c, casted_), (casted_.shape[0], 1)) for c in [b, y, x, d]], axis=-1)
-        return byxd
-
-    K, _, I = kernels.shape
-    kernels = tf.reshape(kernels, shape=(K, K, 1, I), name='kernel')
-    paddings = tf.constant([[0, 0], [K // 2, K // 2], [K // 2, K // 2], [0, 0]], dtype=tf.int32)
-
-    pyramid = []
-    DOG_pyramid = []
-    DOG_pyramid_extrema_points = []
-
-    for _ in tf.range(num_octaves):
-        image_pad = tf.pad(image, paddings, mode='SYMMETRIC')
-
-        image_blur = tf.nn.convolution(image_pad, kernels, padding='VALID')
-
-        pyramid.append(image_blur)
-
-        dog = image_blur[..., 1:] - image_blur[..., :-1]
-        DOG_pyramid.append(dog)
-
-        curr_extrema = extrema(dog)
-        DOG_pyramid_extrema_points.append(curr_extrema)
-
-        octave_base = tf.expand_dims(image_blur[..., -3], axis=-1)
-        _, Oh, Ow, _ = octave_base.get_shape()
-        image = tf.image.resize(octave_base, size=[Oh // 2, Ow // 2], method='nearest')
-
-    return DOG_pyramid, DOG_pyramid_extrema_points
+    n_octaves = tf.round(diff / math.log(2.0)) + 1
+    return tf.cast(n_octaves, tf.int32)
 
 
-def compute_gradient_xyz(X):
+def compute_gradient_xyz(
+        X: tf.Tensor
+) -> tf.Tensor:
     shape_ = X.get_shape()
     assert len(shape_) == 4
 
@@ -195,7 +304,9 @@ def compute_gradient_xyz(X):
     return tf.reshape(grad, shape=(-1, 3, 1))
 
 
-def compute_hessian_xyz(F):
+def compute_hessian_xyz(
+        F: tf.Tensor
+) -> tf.Tensor:
     shape_ = F.get_shape()
     assert len(shape_) == 4
 
@@ -259,67 +370,93 @@ def compute_hessian_xyz(F):
     return hessian_mat
 
 
-def localize_extrema():
-    return
+def compute_extrema(
+        X: tf.Tensor,
+        threshold: Union[tf.Tensor, float, None] = None
+) -> tf.Tensor:
+    threshold = threshold if threshold is not None else THRESHOLD
+    _, h, w, d = X.shape
+    X_pad = tf.pad(
+        X, tf.constant([[0, 0], [1, 1], [1, 1], [0, 0]], dtype=tf.int32), constant_values=0.0
+    )
+    # TODO: this is not correct if : abs(min(h)) > abs(max(h)) so we throw the local maxima!!!
+    X_pad = tf.transpose(math.abs(X_pad), perm=(0, 3, 1, 2))[..., tf.newaxis]
+
+    extrema = tf.nn.max_pool3d(
+        X_pad, (3, 3, 3), (1, 1, 1), 'VALID', data_format='NDHWC'
+    )
+
+    extrema = tf.transpose(tf.squeeze(extrema, axis=-1), perm=(0, 2, 3, 1))
+    extrema = tf.pad(
+        extrema, tf.constant([[0, 0], [0, 0], [0, 0], [1, 1]], dtype=tf.int32), constant_values=0.0
+    )
+
+    byxd = tf.where(
+        math.logical_and(
+            math.equal(extrema, tf.abs(X)), math.greater(tf.abs(X), threshold)
+        )
+    )
+
+    def cast(arr, min_val, max_val):
+        return tf.logical_and(tf.math.greater_equal(arr, min_val), tf.math.less_equal(arr, max_val))
+
+    cords_unstack = tf.unstack(byxd, num=4, axis=-1)
+    casted_shape = [[BORDER_WIDTH, h - 1 - BORDER_WIDTH],
+                    [BORDER_WIDTH, w - 1 - BORDER_WIDTH]]
+
+    masked_cords = [cast(cords_unstack[c], casted_shape[c - 1][0], casted_shape[c - 1][1]) for c in
+                    range(1, len(cords_unstack) - 1)]
+
+    casted_ = tf.ones(shape=masked_cords[0].shape, dtype=tf.bool)
+    for mask in masked_cords:
+        casted_ = tf.math.logical_and(casted_, mask)
+
+    casted_ = tf.where(casted_)
+    byxd = tf.concat([tf.reshape(tf.gather(c, casted_), (casted_.shape[0], 1)) for c in cords_unstack], axis=-1)
+    return byxd
+
+
+def pad(X: tf.Tensor, kernel_size: Union[int, tf.Tensor]) -> tf.Tensor:
+    k_ = int(kernel_size)
+    paddings = tf.constant(
+        [[0, 0], [k_ // 2, k_ // 2], [k_ // 2, k_ // 2], [0, 0]], dtype=tf.int32
+    )
+    X_pad = tf.pad(X, paddings, mode='SYMMETRIC')
+    return X_pad
 
 
 if __name__ == '__main__':
-    # show_images(tf.transpose(dOg_pyramid[-1], perm=(3, 1, 2, 0)), 2, 3)
-    img = tf.keras.utils.load_img('box_in_scene.png', color_mode='grayscale')
+    img = tf.keras.utils.load_img('box.png', color_mode='grayscale')
     img = tf.convert_to_tensor(tf.keras.utils.img_to_array(img), dtype=tf.float32)
     img = img[tf.newaxis, ...]
 
-    base_img = base_image(img, sigma=SIGMA, assume_blur=ASSUME_BLUR)
-    kernel_per_interval = intervals_kernels(sigma=SIGMA, intervals=INTERVALS)
-    N_oc = n_octaves(base_img.shape, kernel_per_interval.shape[0])
+    base_image = blur_base_image(img, sigma=SIGMA, assume_blur=ASSUME_BLUR)
+    gaus_kernels = intervals_kernels(sigma=SIGMA, intervals=INTERVALS)
+    kernels_shape_ = gaus_kernels.shape
+    gaus_kernels = tf.reshape(gaus_kernels, shape=(kernels_shape_[0], kernels_shape_[1], 1, kernels_shape_[-1]))
 
-    dOg_pyramid, extrema_points = scale_space_pyramid(
-        base_img, N_oc, kernel_per_interval, border_width=BORDER_WIDTH, contrast_threshold=CONTRAST_THRESHOLD
-    )
+    num_octaves = compute_default_N_octaves(image_shape=base_image.shape, min_shape=kernels_shape_[0])
+    octave_capture = []
+    key_points = []
 
-    poi = extrema_points[0]
-    curr_dog = dOg_pyramid[0]
+    octave_base = tf.identity(base_image)
 
-    neighbor = make_neighborhood3D(poi, con=CON, origin_shape=dOg_pyramid[0].shape)
-    neighbor = tf.reshape(neighbor, shape=(-1, 4))
+    for i in tf.range(num_octaves):
+        octave_base_pad = pad(octave_base, kernels_shape_[0])
+        octave_pyramid = tf.nn.convolution(octave_base_pad, gaus_kernels, padding='VALID')
 
-    values = tf.gather_nd(curr_dog, neighbor)
-    values = values / 255.0
+        octave_pyramid = tf.concat((octave_base, octave_pyramid), axis=-1)
 
-    values = tf.reshape(values, (-1, CON, CON, CON))
+        DOG_pyramid = octave_pyramid[..., 1:] - octave_pyramid[..., :-1]
 
-    grad = compute_gradient_xyz(values)
-    hessian = compute_hessian_xyz(values)
-    extrema = - tf.linalg.lstsq(hessian, grad, l2_regularizer=0.0, fast=True)
-    extrema = tf.reshape(extrema, (-1, 3))
-    ex, ey, ez = tf.unstack(extrema, num=3, axis=1)
+        current_octave = Octave(
+            index=i, base_X=octave_base, gaussian_images=octave_pyramid,
+            dog_images=DOG_pyramid, init_extrema=compute_extrema(DOG_pyramid)
+        )
 
-    # next cord case:
+        octave_base = tf.expand_dims(octave_pyramid[..., -3], axis=-1)
+        _, Oh, Ow, _ = octave_base.get_shape()
+        octave_base = tf.image.resize(octave_base, size=[Oh // 2, Ow // 2], method='nearest')
 
-    # next_cords = tf.where(math.logical_or(math.logical_or(tf.abs(ex) >= 0.5, tf.abs(ey) >= 0.5), tf.abs(ez) >= 0.5))
-    # positions_move = tf.gather_nd(tf.stack((ey, ex, ez), axis=-1), next_cords)
-    # next_cords = tf.gather_nd(poi, next_cords)
-    #
-    # positions_move = tf.pad(positions_move, paddings=tf.constant([[0, 0], [1, 0]], dtype=tf.int32), constant_values=0)
-    #
-    # next_cords = next_cords + tf.cast(tf.round(positions_move), dtype=tf.int64)
-    #
-    # next_cords = cast_cords(next_cords, shape=curr_dog.shape)
-
-    # key point case:
-
-    maby_key_points = tf.where(math.logical_and(math.logical_and(tf.abs(ex) < 0.5, tf.abs(ey) < 0.5), tf.abs(ez) < 0.5))
-    grad = tf.gather_nd(grad, maby_key_points)
-    hessian = tf.gather_nd(hessian, maby_key_points)
-    extrema = tf.gather_nd(extrema, maby_key_points)
-    maby_key_values = tf.gather_nd(values, maby_key_points)
-    maby_key_values = maby_key_values[:, 1, 1, 1]
-
-    dot = tf.reduce_sum(
-        tf.multiply(
-            extrema[:, tf.newaxis, tf.newaxis, ...], tf.transpose(grad, perm=(0, 2, 1))[:, tf.newaxis, ...]
-        ),
-        axis=-1, keepdims=False
-    )
-    dot = tf.reshape(dot, shape=(-1,))
-    functionValue = maby_key_values + 0.5 * dot
+        key_points += current_octave(iterations=N_ATTEMPTS)
+        octave_capture.append(current_octave)
