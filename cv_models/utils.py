@@ -1,4 +1,5 @@
 import tensorflow as tf
+from typing import Union
 
 PI = tf.cast(
     tf.math.angle(tf.constant(-1, dtype=tf.complex64)), tf.float32
@@ -77,3 +78,60 @@ def clip_to_shape(X, shape, **kwargs):
 
     return tf.pad(X, paddings, **kwargs)
 
+
+def make_neighborhood3D(
+        init_cords: tf.Tensor,
+        con: int = 3,
+        origin_shape: Union[None, tuple, list, tf.TensorShape] = None):
+    B, ndim = init_cords.get_shape()
+
+    assert ndim == 4
+
+    ax = tf.range(-con // 2 + 1, (con // 2) + 1, dtype=tf.int64)
+
+    con_kernel = tf.stack(tf.meshgrid(ax, ax, ax), axis=-1)
+
+    con_kernel = tf.reshape(con_kernel, shape=(1, con ** 3, 3))
+
+    b, yxd = tf.split(init_cords, [1, 3], axis=1)
+    yxd = yxd[:, tf.newaxis, ...]
+
+    yxd = yxd + con_kernel
+
+    b = tf.repeat(b[:, tf.newaxis, ...], repeats=con ** 3, axis=1)
+
+    neighbor = tf.concat((b, yxd), axis=-1)
+    if origin_shape is None:
+        return neighbor
+
+    assert len(origin_shape) == 4
+
+    neighbor = tf.reshape(neighbor, shape=(-1, 4))
+    neighbor = cast_cords(neighbor, origin_shape)
+    return tf.reshape(neighbor, shape=(-1, con ** 3, 4))
+
+
+def cast_cords(cords, shape):
+    cords_shape_ = cords.get_shape()
+    assert len(cords_shape_) == 2
+    assert cords_shape_[1] == len(shape)
+
+    def cast(arr, min_val, max_val):
+        arr = tf.reshape(arr, shape=(-1,))
+        arr = tf.where(tf.math.greater(arr, max_val), -1, arr)
+        arr = tf.where(tf.math.less(arr, min_val), -1, arr)
+        return arr
+
+    cords_unstack = tf.split(cords, [1] * len(shape), axis=-1)
+    masked_cords = [cast(cords_unstack[c + 1], 0, shape[c + 1] - 1) for c in range(len(shape) - 1)]
+    masked_cords = [tf.reshape(cords_unstack[0], shape=(-1, ))] + masked_cords
+
+    casted_ = tf.ones(shape=masked_cords[0].shape, dtype=tf.bool)
+
+    for i in range(1, len(shape)):
+        casted_ = tf.math.logical_and(casted_, masked_cords[i] > 0)
+
+    casted_ = tf.where(casted_)
+
+    ret = tf.concat([tf.reshape(tf.gather(c, casted_), (casted_.shape[0], 1)) for c in masked_cords], axis=-1)
+    return ret
