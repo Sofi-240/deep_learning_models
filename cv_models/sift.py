@@ -1,6 +1,6 @@
 from typing import Union
 import tensorflow as tf
-from cv_models.utils import PI, gaussian_kernel, clip_to_shape, make_neighborhood3D, cast_cords
+from cv_models.utils import PI, gaussian_kernel, clip_to_shape, make_neighborhood3D, make_neighborhood2D
 from tensorflow.python.keras import backend
 import numpy as np
 from collections import namedtuple
@@ -25,14 +25,87 @@ EXTREMA_OFFSET = .5
 EIGEN_RATIO = 10
 DTYPE = backend.floatx()
 THRESHOLD = tf.floor(0.5 * CONTRAST_THRESHOLD / 3.0 * 255.0)
+SCALE_FACTOR = 1.5
+PEAK_RATIO = .8
+N_BINS = 36
+RADIUS = 3
 
 
-class KeyPoints:
-    def __init__(self, pt, octave, size, response):
-        self.pt = pt
-        self.octave = octave
-        self.o_size = size
-        self.response = response
+class KeyPointSift:
+    def __init__(self):
+        self.pt = tf.constant([[]], shape=(0, 4), dtype=DTYPE)
+        self.size = tf.constant([[]], shape=(0,), dtype=DTYPE)
+        self.angle = tf.constant([[]], shape=(0,), dtype=DTYPE)
+        self.octave = tf.constant([[]], shape=(0,), dtype=tf.int32)
+        self.octave_id = tf.constant([[]], shape=(0,), dtype=tf.int32)
+        self.response = tf.constant([[]], shape=(0,), dtype=DTYPE)
+
+    def __len__(self):
+        _shape = self.pt.get_shape()
+        return _shape[0]
+
+    def __getitem__(self, index):
+        assert isinstance(index, int)
+        if index >= self.__len__():
+            raise IndexError('Index out of range')
+        key_point = namedtuple(f'key_point_{index}', 'pt, size, angle, octave, octave_id, response')
+        ret = key_point(
+            pt=tf.reshape(self.pt[index], (1, 4)),
+            size=self.size[index],
+            angle=self.angle[index],
+            octave=self.octave[index],
+            octave_id=self.octave_id[index],
+            response=self.response[index]
+        )
+        return ret
+
+    def add_key(self,
+                pt: Union[tf.Tensor, list, tuple],
+                size: Union[tf.Tensor, float],
+                angle: Union[tf.Tensor, float] = 0.0,
+                octave: Union[tf.Tensor, int] = 0,
+                octave_id: Union[tf.Tensor, int] = 0,
+                response: Union[tf.Tensor, float] = -1.0):
+        if isinstance(size, float):
+            size = tf.convert_to_tensor([size])
+
+        n_points_ = max(size.shape)
+
+        def map_args(arg):
+            if not isinstance(arg, tf.Tensor):
+                return tf.convert_to_tensor([arg] * n_points_)
+            shape_ = arg.shape
+            n_dim = len(shape_)
+            assert n_dim <= 2
+            if n_dim == 0 or (n_dim == 1 and shape_[0] == 1):
+                arg = tf.get_static_value(arg)
+                arg = arg[0] if isinstance(arg, np.ndarray) else arg
+                return tf.convert_to_tensor([arg] * n_points_)
+            arg = tf.reshape(arg, shape=(-1,))
+            assert arg.shape[0] == n_points_
+            return arg
+
+        pt = tf.cast(tf.reshape(pt, shape=(-1, 4)), dtype=DTYPE)
+        assert pt.shape[0] == n_points_
+        self.pt = tf.concat((self.pt, pt), axis=0)
+
+        size = tf.cast(tf.reshape(size, shape=(-1,)), dtype=DTYPE)
+        self.size = tf.concat((self.size, size), axis=0)
+
+        args = [angle, octave, octave_id, response]
+        angle, octave, octave_id, response = list(map(map_args, args))
+
+        angle = tf.cast(angle, dtype=DTYPE)
+        self.angle = tf.concat((self.angle, angle), axis=0)
+
+        octave = tf.cast(octave, dtype=tf.int32)
+        self.octave = tf.concat((self.octave, octave), axis=0)
+
+        octave_id = tf.cast(octave_id, dtype=tf.int32)
+        self.octave_id = tf.concat((self.octave_id, octave_id), axis=0)
+
+        response = tf.cast(response, dtype=DTYPE)
+        self.response = tf.concat((self.response, response), axis=0)
 
 
 def gaussian_blur(
@@ -217,6 +290,22 @@ def compute_gradient_xyz(
     return tf.reshape(grad, shape=(-1, 3, 1))
 
 
+def compute_gradient_xy(
+        X: tf.Tensor
+) -> tf.Tensor:
+    shape_ = X.get_shape()
+    assert len(shape_) == 4
+
+    kx = tf.constant([[0.0, 0.0, 0.0], [-1.0, 0.0, 1.0], [0.0, 0.0, 0.0]], dtype=DTYPE)
+    kx = tf.reshape(kx, shape=(3, 3, 1, 1))
+    ky = tf.constant([[0.0, -1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=DTYPE)
+    ky = tf.reshape(ky, shape=(3, 3, 1, 1))
+
+    kernels_dx = tf.concat((kx, ky), axis=-1)
+    grad = tf.nn.convolution(X, kernels_dx, padding='VALID')
+    return grad
+
+
 def compute_hessian_xyz(
         F: tf.Tensor
 ) -> tf.Tensor:
@@ -318,14 +407,17 @@ def split_extrema_cond(
 def localize_extrema(
         middle_pixel_cords: tf.Tensor,
         dOg_array: tf.Tensor,
-        octave_index: Union[int, float]
-) -> tuple[Union[tf.Tensor, None], Union[KeyPoints, None]]:
+        octave_index: Union[int, float],
+        keyPoint_pointer: Union[KeyPointSift, None] = None
+) -> tuple[Union[tf.Tensor, None], Union[tuple, None, KeyPointSift]]:
     dog_shape_ = dOg_array.shape
 
     cube_neighbor = make_neighborhood3D(middle_pixel_cords, con=CON, origin_shape=dog_shape_)
     if cube_neighbor.shape[0] == 0:
-        print('cube neighbor size is 0')
         return None, None
+
+    # the size can change because the make_neighborhood3D return only the valid indexes
+    middle_pixel_cords = cube_neighbor[:, (CON ** 3) // 2, :]
 
     cube_values = tf.gather_nd(dOg_array, tf.reshape(cube_neighbor, shape=(-1, 4))) / 255.0
     cube_values = tf.reshape(cube_values, (-1, CON, CON, CON))
@@ -380,13 +472,20 @@ def localize_extrema(
     kp_size = SIGMA * (2 ** ((cz + ez) / tf.cast(INTERVALS, dtype=DTYPE))) * (2 ** (octave_index + 1.0))
     kp_response = math.abs(tf.boolean_mask(update_response, sure_key_points))
 
-    kp = KeyPoints(kp_pt, kp_octave, kp_size, kp_response)
+    if keyPoint_pointer is not None:
+        keyPoint_pointer.add_key(
+            pt=kp_pt, octave=kp_octave, size=kp_size, response=kp_response,
+            octave_id=tf.cast(octave_index, dtype=tf.int32)
+        )
+        return next_step_cords, keyPoint_pointer
+    kp = namedtuple('KeyPoint', 'pt, octave, o_size, response, octave_index')
+    kp = kp(kp_pt, kp_octave, kp_size, kp_response, tf.cast(octave_index, dtype=tf.int32))
     return next_step_cords, kp
 
 
 def main():
     img = tf.keras.utils.load_img('box.png', color_mode='grayscale')
-    img = tf.convert_to_tensor(tf.keras.utils.img_to_array(img), dtype=tf.float32)
+    img = tf.convert_to_tensor(tf.keras.utils.img_to_array(img), dtype=DTYPE)
     img = img[tf.newaxis, ...]
 
     base_image = blur_base_image(img, sigma=SIGMA, assume_blur=ASSUME_BLUR)
@@ -396,7 +495,8 @@ def main():
 
     num_octaves = compute_default_N_octaves(image_shape=base_image.shape, min_shape=kernels_shape_[0])
     octave_capture = []
-    octave_tup = namedtuple('octave', 'index, base, gaus_img, dog_image, init_extrema')
+    key_points_capture = KeyPointSift()
+    octave_tup = namedtuple('octave', 'index, base, gaus_img, dog_image')
 
     octave_base = tf.identity(base_image)
 
@@ -408,19 +508,25 @@ def main():
 
         DOG_pyramid = octave_pyramid[..., 1:] - octave_pyramid[..., :-1]
 
-        init_extrema = compute_extrema(DOG_pyramid)
+        continue_search = compute_extrema(DOG_pyramid)
+
+        for _ in tf.range(N_ATTEMPTS):
+            continue_search, _ = localize_extrema(continue_search, DOG_pyramid, i, keyPoint_pointer=key_points_capture)
+
+            if continue_search is None:
+                break
 
         octave_capture.append(
-            octave_tup(i, octave_base, octave_pyramid, DOG_pyramid, init_extrema)
+            octave_tup(i, octave_base, octave_pyramid, DOG_pyramid)
         )
 
         octave_base = tf.expand_dims(octave_pyramid[..., -3], axis=-1)
         _, Oh, Ow, _ = octave_base.get_shape()
         octave_base = tf.image.resize(octave_base, size=[Oh // 2, Ow // 2], method='nearest')
 
-    return_tup = namedtuple('main', 'img, base_image, gaus_kernels, num_octaves, octave_capture')
+    return_tup = namedtuple('main', 'img, gaussian_kernels, n_octaves, octave_cap, kp_cap')
 
-    return return_tup(img, base_image, gaus_kernels, num_octaves, octave_capture)
+    return return_tup(img, gaus_kernels, num_octaves, octave_capture, key_points_capture)
 
 
 if __name__ == '__main__':
@@ -530,6 +636,40 @@ if __name__ == '__main__':
 
     cap = main()
 
-    curr_oc = cap.octave_capture[0]
+    octave_cap = cap.octave_cap
+    kp_cap = cap.kp_cap
 
-    continue_search, key_points = localize_extrema(curr_oc.init_extrema, curr_oc.dog_image, curr_oc.index)
+    # scale = SCALE_FACTOR * size / (2 ** (tf.cast(octave_index, dtype=DTYPE) + 1))
+    # radius = tf.cast(tf.round(RADIUS * scale), dtype=tf.int32)
+    # weight_factor = -0.5 / (scale ** 2)
+    # _prob = 1.0 / tf.cast(2 ** octave_index, dtype=DTYPE)
+    # _one = tf.ones_like(_prob)
+    # _prob = tf.stack((_one, _prob, _prob, _one), axis=-1)
+    # region_center = tf.cast(pt * _prob, dtype=tf.int64)
+    # for k in range(len(kp_cap)):
+    #     octave_ = octave_cap[kp_cap.octave_index[k]]
+    #     con = (kp_cap.radius[k] * 2) + 3
+    #     block = make_neighborhood2D(
+    #         tf.reshape(kp_cap.region_center[k], shape=(1, 4)), con=con, origin_shape=octave_.gaus_img.shape
+    #     )
+    #     gaus_img = tf.gather_nd(octave_.gaus_img, tf.reshape(block, shape=(-1, 4)))
+    #     gaus_img = tf.reshape(gaus_img, shape=(1, con, con, 1))
+    #     gaus_grad = compute_gradient_xy(gaus_img)
+    #
+    #     dx, dy = tf.split(gaus_grad, [1, 1], axis=-1)
+    #     magnitude = math.sqrt(dx * dx + dy * dy)
+    #     orientation = math.atan2(dx, dy) * (180.0 / PI)
+    #
+    #     neighbor_index = make_neighborhood2D(tf.constant([[0, 0, 0, 0]], dtype=tf.int64), con=con - 2)
+    #     neighbor_index = tf.cast(tf.reshape(neighbor_index, shape=(1, con - 2, con - 2, 4)), dtype=DTYPE)
+    #     _, i, j, _ = tf.split(neighbor_index, [1, 1, 1, 1], axis=-1)
+    #
+    #     weight = math.exp(kp_cap.weight_factor[k] * (i ** 2 + j ** 2))
+    #     histogram_index = tf.cast(tf.round(orientation * N_BINS / 360.), dtype=tf.int64)
+    #     histogram_index = histogram_index % N_BINS
+    #     histogram_index = tf.reshape(histogram_index, (-1, 1))
+    #
+    #     hist = tf.zeros(shape=(N_BINS,), dtype=DTYPE)
+    #     hist = tf.tensor_scatter_nd_add(hist, histogram_index, tf.reshape(weight * magnitude, (-1,)))
+    #
+    #     kp_cap.histogram = tf.concat((kp_cap.histogram, tf.reshape(hist, shape=(1, -1))), axis=0)

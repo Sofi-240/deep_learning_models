@@ -111,6 +111,47 @@ def make_neighborhood3D(
     return neighbor
 
 
+def make_neighborhood2D(
+        init_cords: tf.Tensor,
+        con: int = 3,
+        origin_shape: Union[None, tuple, list, tf.TensorShape] = None
+) -> tf.Tensor:
+    B, ndim = init_cords.get_shape()
+
+    assert ndim == 4
+
+    ax = tf.range(-con // 2 + 1, (con // 2) + 1, dtype=tf.int64)
+
+    con_kernel = tf.stack(tf.meshgrid(ax, ax), axis=-1)
+
+    con_kernel = tf.reshape(con_kernel, shape=(1, con ** 2, 2))
+
+    b, yx, d = tf.split(init_cords, [1, 2, 1], axis=1)
+    yx = yx[:, tf.newaxis, ...]
+
+    yx = yx + con_kernel
+
+    b = tf.repeat(b[:, tf.newaxis, ...], repeats=con ** 2, axis=1)
+    d = tf.repeat(d[:, tf.newaxis, ...], repeats=con ** 2, axis=1)
+
+    neighbor = tf.concat((b, yx, d), axis=-1)
+    if origin_shape is None:
+        return neighbor
+
+    assert len(origin_shape) == 4
+    neighbor = neighbor + 1
+    b, y, x, d = tf.unstack(neighbor, num=4, axis=-1)
+
+    y_cast = tf.logical_and(tf.math.greater_equal(y, 1), tf.math.less_equal(y, origin_shape[1]))
+    x_cast = tf.logical_and(tf.math.greater_equal(x, 1), tf.math.less_equal(x, origin_shape[2]))
+
+    valid = tf.cast(tf.logical_and(y_cast, x_cast), dtype=tf.int32)
+    valid = tf.math.reduce_prod(valid, axis=-1)
+    cords_valid = tf.where(valid == 1)
+    neighbor = tf.gather_nd(neighbor, cords_valid) - 1
+    return neighbor
+
+
 def cast_cords(
         cords: tf.Tensor,
         shape: Union[tf.Tensor, list, tuple]
