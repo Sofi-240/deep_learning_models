@@ -59,45 +59,6 @@ def gaussian_blur(
     return Xg
 
 
-def clip_to_shape(
-        X: tf.Tensor,
-        shape: Union[tf.Tensor, list, tuple],
-        **kwargs
-) -> tf.Tensor:
-    shape_ = X.get_shape()
-    n_dim_ = len(shape_)
-
-    assert 2 <= n_dim_ <= 4
-    assert len(shape) == 2
-
-    b_pad = []
-    d_pad = []
-
-    if n_dim_ == 4:
-        shape_ = shape_[1:3]
-        b_pad, d_pad = [[0, 0], [0, 0]]
-    elif n_dim_ == 3:
-        shape_ = shape_[:-1]
-        d_pad = [0, 0]
-
-    h, w = shape_
-    H, W = shape
-
-    pad_h = int(H - h)
-    pad_h = [pad_h // 2, pad_h - pad_h // 2]
-
-    pad_w = int(W - w)
-    pad_w = [pad_w // 2, pad_w - pad_w // 2]
-
-    paddings = [pad_h, pad_w]
-    paddings += [d_pad] if d_pad else []
-    paddings = [b_pad] + paddings if b_pad else paddings
-
-    paddings = tf.constant(paddings, dtype=tf.int32)
-
-    return tf.pad(X, paddings, **kwargs)
-
-
 def make_neighborhood3D(
         init_cords: tf.Tensor,
         con: int = 3,
@@ -207,7 +168,8 @@ def compute_extrema3D(
         X: tf.Tensor,
         threshold: Union[tf.Tensor, float, None] = None,
         con: Union[tf.Tensor, int, tuple, list] = 3,
-        border_width: Union[tf.Tensor, tuple, list, None] = None
+        border_width: Union[tf.Tensor, tuple, list, None] = None,
+        epsilon: Union[tf.Tensor, float] = 1e-07
 ) -> tf.Tensor:
     _shape = tf.shape(X)
     _n_dims = len(_shape)
@@ -250,8 +212,15 @@ def compute_extrema3D(
     _, compare_array, _ = tf.split(compare_array, [half_con[1], w - 2 * half_con[1], half_con[1]], axis=2)
     _, compare_array, _ = tf.split(compare_array, [half_con[0], h - 2 * half_con[0], half_con[0]], axis=1)
 
+    def _equal_with_epsilon(arr):
+        return tf.logical_and(
+            tf.math.greater_equal(arr, compare_array - epsilon),
+            tf.math.less_equal(arr, compare_array + epsilon)
+        )
+
     extrema_cond = tf.logical_or(
-        tf.math.equal(extrema_max, compare_array), tf.math.equal(extrema_min, compare_array)
+        _equal_with_epsilon(extrema_max),
+        _equal_with_epsilon(extrema_min)
     )
     if threshold is not None:
         extrema_cond = tf.logical_and(extrema_cond, tf.math.greater(tf.abs(compare_array), threshold))

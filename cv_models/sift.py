@@ -1,6 +1,6 @@
 from typing import Union
 import tensorflow as tf
-from cv_models.utils import PI, gaussian_kernel, compute_extrema3D, clip_to_shape, make_neighborhood3D, \
+from cv_models.utils import PI, gaussian_kernel, compute_extrema3D, make_neighborhood3D, \
     make_neighborhood2D, gaussian_blur, compute_central_gradient3D, compute_central_gradient2D, compute_hessian_3D
 from tensorflow.python.keras import backend
 import numpy as np
@@ -13,36 +13,23 @@ math = tf.math
 linalg = tf.linalg
 
 backend.set_floatx('float32')
-
 # https://www.cs.ubc.ca/~lowe/papers/ijcv04.pdf
 
-SIGMA = 1.6
-INTERVALS = 3
-BORDER_WIDTH = 5
-CONTRAST_THRESHOLD = 0.04
-CON = 3
-N_ATTEMPTS = 5
-EXTREMA_OFFSET = .5
-EIGEN_RATIO = 10
-THRESHOLD = tf.floor(0.5 * CONTRAST_THRESHOLD / 3.0 * 255.0)
-SCALE_FACTOR = 1.5
-PEAK_RATIO = .8
-N_BINS = 36
-RADIUS = 3
+
 KeyPoint = namedtuple(f'KeyPoint', 'pt, size, angle, octave, octave_id, response')
 Octave = namedtuple('Octave', 'octave_id, gaus_X, dog_X')
 
 
 class KeyPointSift:
-    DTYPE = backend.floatx()
 
     def __init__(self):
-        self.pt = tf.constant([[]], shape=(0, 4), dtype=self.DTYPE)
-        self.size = tf.constant([[]], shape=(0,), dtype=self.DTYPE)
-        self.angle = tf.constant([[]], shape=(0,), dtype=self.DTYPE)
+        self.__DTYPE = backend.floatx()
+        self.pt = tf.constant([[]], shape=(0, 4), dtype=self.__DTYPE)
+        self.size = tf.constant([[]], shape=(0,), dtype=self.__DTYPE)
+        self.angle = tf.constant([[]], shape=(0,), dtype=self.__DTYPE)
         self.octave = tf.constant([[]], shape=(0,), dtype=tf.int32)
         self.octave_id = tf.constant([[]], shape=(0,), dtype=tf.int32)
-        self.response = tf.constant([[]], shape=(0,), dtype=self.DTYPE)
+        self.response = tf.constant([[]], shape=(0,), dtype=self.__DTYPE)
 
     def __len__(self):
         _shape = self.pt.get_shape()
@@ -102,17 +89,17 @@ class KeyPointSift:
             assert arg.shape[0] == n_points_
             return arg
 
-        pt = tf.cast(tf.reshape(pt, shape=(-1, 4)), dtype=self.DTYPE)
+        pt = tf.cast(tf.reshape(pt, shape=(-1, 4)), dtype=self.__DTYPE)
         assert pt.shape[0] == n_points_
         self.pt = tf.concat((self.pt, pt), axis=0)
 
-        size = tf.cast(tf.reshape(size, shape=(-1,)), dtype=self.DTYPE)
+        size = tf.cast(tf.reshape(size, shape=(-1,)), dtype=self.__DTYPE)
         self.size = tf.concat((self.size, size), axis=0)
 
         args = [angle, octave, octave_id, response]
         angle, octave, octave_id, response = list(map(map_args, args))
 
-        angle = tf.cast(angle, dtype=self.DTYPE)
+        angle = tf.cast(angle, dtype=self.__DTYPE)
         self.angle = tf.concat((self.angle, angle), axis=0)
 
         octave = tf.cast(octave, dtype=tf.int32)
@@ -121,23 +108,38 @@ class KeyPointSift:
         octave_id = tf.cast(octave_id, dtype=tf.int32)
         self.octave_id = tf.concat((self.octave_id, octave_id), axis=0)
 
-        response = tf.cast(response, dtype=self.DTYPE)
+        response = tf.cast(response, dtype=self.__DTYPE)
         self.response = tf.concat((self.response, response), axis=0)
 
 
 class SIFT:
-    DTYPE = backend.floatx()
 
-    def __init__(self, name: Union[str, None] = None):
+    def __init__(
+            self,
+            sigma: float = 1.6,
+            n_intervals: int = 3,
+            name: Union[str, None] = None
+    ):
         self.name = name or 'SIFT'
+        self.__DTYPE = backend.floatx()
+        self.__n_bins = 36
+        self.__eigen_ration = 10
+        self.__peak_ratio = 0.8
+        self.__contrast_threshold = 0.04
+        self.__scale_factor = 1.5
+        self.__extrema_offset = 0.5
+        self.__radius_factor = 3
+        self.__con = 3
+        self.epsilon = 1e-05
         self.octave_pyramid = []
         self.input = None
         self.X_base = None
         self.gaussian_kernels = None
         self.n_octaves = None
-        self.n_intervals = tf.cast(3, dtype=tf.int32)
-        self.sigma = tf.cast(1.6, dtype=self.DTYPE)
+        self.n_intervals = tf.cast(n_intervals, dtype=tf.int32)
+        self.sigma = tf.cast(sigma, dtype=self.__DTYPE)
         self.key_points = KeyPointSift()
+        self.border_width = (3, 3, 0)
 
     def build_pyramid(
             self,
@@ -154,14 +156,14 @@ class SIFT:
                 'expected the inputs to be grayscale images with size of (None, h, w, 1)'
             )
         b, h, w, d = tf.unstack(_shape, num=4, axis=-1)
-        self.sigma = tf.cast(sigma, dtype=self.DTYPE)
-        self.n_intervals = tf.cast(num_intervals, dtype=self.DTYPE)
+        self.sigma = tf.cast(sigma, dtype=self.__DTYPE)
+        self.n_intervals = tf.cast(num_intervals, dtype=self.__DTYPE)
 
         # calculate the base image with up sampling with factor 2
         self.X_base = inputs
         X_base = tf.image.resize(inputs, size=[h * 2, w * 2], method='bilinear', name='X_base')
 
-        assume_blur = tf.cast(assume_blur_sigma, dtype=self.DTYPE)
+        assume_blur = tf.cast(assume_blur_sigma, dtype=self.__DTYPE)
         delta_sigma = (self.sigma ** 2) - ((2 * assume_blur) ** 2)
         delta_sigma = math.sqrt(tf.maximum(delta_sigma, 0.64))
 
@@ -172,7 +174,7 @@ class SIFT:
         images_per_octaves = self.n_intervals + 3
         K = 2 ** (1 / self.n_intervals)
 
-        sigma_prev = (K ** (tf.cast(tf.range(1, images_per_octaves), dtype=self.DTYPE) - 1.0)) * self.sigma
+        sigma_prev = (K ** (tf.cast(tf.range(1, images_per_octaves), dtype=self.__DTYPE) - 1.0)) * self.sigma
         sigmas = math.sqrt((K * sigma_prev) ** 2 - sigma_prev ** 2)
 
         self.gaussian_kernels = [
@@ -217,25 +219,23 @@ class SIFT:
 
     def extract_keypoints(
             self,
-            N_iterations: Union[tf.Tensor, int] = 5,
-            contrast_threshold: Union[tf.Tensor, float] = 0.04,
-            con: Union[tf.Tensor, int] = 3,
-            border_width: Union[tf.Tensor, int] = 5
+            n_iterations: Union[tf.Tensor, int] = 5,
+            contrast_threshold: Union[tf.Tensor, float] = 0.04
     ) -> KeyPointSift:
 
         temp_key_point = KeyPointSift()
 
-        N_iterations = int(N_iterations)
+        n_iterations = int(n_iterations)
         threshold = tf.floor(0.5 * contrast_threshold / 3.0 * 255.0)
-        con = int(con)
-        border_width = int(border_width)
-        border_width = (border_width, border_width, 0)
+        border_width = self.border_width
 
         for octave in self.octave_pyramid:
             dog = octave.dog_X
-            continue_search = compute_extrema3D(dog, threshold=threshold, con=con, border_width=border_width)
+            continue_search = compute_extrema3D(
+                dog, threshold=threshold, con=self.__con, border_width=border_width, epsilon=self.epsilon
+            )
 
-            for _ in tf.range(N_iterations):
+            for _ in tf.range(n_iterations):
                 continue_search, _ = self.__localize_extrema(
                     continue_search, dog, octave.octave_id, keyPoint_pointer=temp_key_point
                 )
@@ -243,7 +243,7 @@ class SIFT:
                 if continue_search is None:
                     break
 
-        histogram = tf.constant([[]], shape=(0, N_BINS), dtype=self.DTYPE)
+        histogram = tf.constant([[]], shape=(0, self.__n_bins), dtype=self.__DTYPE)
 
         del_points = []
         for k in range(len(temp_key_point)):
@@ -258,7 +258,7 @@ class SIFT:
             for p in range(len(del_points)):
                 del temp_key_point[del_points[p] - p]
 
-        gaussian1D = tf.constant([1, 4, 6, 4, 1], dtype=self.DTYPE) / 16.0
+        gaussian1D = tf.constant([1, 4, 6, 4, 1], dtype=self.__DTYPE) / 16.0
         gaussian1D = tf.reshape(gaussian1D, shape=(-1, 1, 1))
 
         histogram_pad = tf.pad(
@@ -271,8 +271,8 @@ class SIFT:
         smooth_histogram = tf.squeeze(smooth_histogram, axis=-1)
 
         orientation_max = tf.reduce_max(smooth_histogram, axis=-1)
-        value_cond = tf.repeat(tf.reshape(orientation_max, shape=(-1, 1)), repeats=N_BINS, axis=-1)
-        value_cond = value_cond * PEAK_RATIO
+        value_cond = tf.repeat(tf.reshape(orientation_max, shape=(-1, 1)), repeats=self.__n_bins, axis=-1)
+        value_cond = value_cond * self.__peak_ratio
 
         cond = math.logical_and(
             math.greater(smooth_histogram, tf.roll(smooth_histogram, shift=1, axis=1)),
@@ -287,16 +287,16 @@ class SIFT:
 
         p_id, p_idx = tf.unstack(peak_index, num=2, axis=-1)
 
-        left_index = (p_idx - 1) % N_BINS
-        right_index = (p_idx + 1) % N_BINS
+        left_index = (p_idx - 1) % self.__n_bins
+        right_index = (p_idx + 1) % self.__n_bins
 
         left_value = tf.gather_nd(smooth_histogram, tf.stack((p_id, left_index), axis=-1))
         right_value = tf.gather_nd(smooth_histogram, tf.stack((p_id, right_index), axis=-1))
 
-        interpolated_peak_index = ((tf.cast(p_idx, dtype=self.DTYPE) + 0.5 * (left_value - right_value)) / (
-                left_value - (2 * peak_value) + right_value)) % N_BINS
+        interpolated_peak_index = ((tf.cast(p_idx, dtype=self.__DTYPE) + 0.5 * (left_value - right_value)) / (
+                left_value - (2 * peak_value) + right_value)) % self.__n_bins
 
-        orientation = 360. - interpolated_peak_index * 360. / N_BINS
+        orientation = 360. - interpolated_peak_index * 360. / self.__n_bins
 
         orientation = tf.where(math.less(math.abs(orientation), 1e-7), 0.0, orientation)
 
@@ -320,10 +320,10 @@ class SIFT:
         assert len(image_shape) == 4
         b, h, w, d = tf.unstack(image_shape, num=4)
 
-        s_ = tf.cast(min([h, w]), dtype=self.DTYPE)
+        s_ = tf.cast(min([h, w]), dtype=self.__DTYPE)
         diff = math.log(s_)
         if min_shape > 1:
-            diff = diff - math.log(tf.cast(min_shape, dtype=self.DTYPE))
+            diff = diff - math.log(tf.cast(min_shape, dtype=self.__DTYPE))
 
         n_octaves = tf.round(diff / math.log(2.0)) + 1
         return tf.cast(n_octaves, tf.int32)
@@ -333,21 +333,19 @@ class SIFT:
             middle_pixel_cords: tf.Tensor,
             dOg_array: tf.Tensor,
             octave_index: Union[int, float],
-            contrast_threshold: Union[tf.Tensor, float] = 0.04,
-            eigen_ratio: Union[tf.Tensor, int, float] = 10,
             keyPoint_pointer: Union[KeyPointSift, None] = None
     ) -> tuple[Union[tf.Tensor, None], Union[tuple, None, KeyPointSift]]:
         dog_shape_ = dOg_array.shape
 
-        cube_neighbor = make_neighborhood3D(middle_pixel_cords, con=CON, origin_shape=dog_shape_)
+        cube_neighbor = make_neighborhood3D(middle_pixel_cords, con=self.__con, origin_shape=dog_shape_)
         if cube_neighbor.shape[0] == 0:
             return None, None
 
         # the size can change because the make_neighborhood3D return only the valid indexes
-        middle_pixel_cords = cube_neighbor[:, (CON ** 3) // 2, :]
+        middle_pixel_cords = cube_neighbor[:, (self.__con ** 3) // 2, :]
 
         cube_values = tf.gather_nd(dOg_array, tf.reshape(cube_neighbor, shape=(-1, 4))) / 255.0
-        cube_values = tf.reshape(cube_values, (-1, CON, CON, CON))
+        cube_values = tf.reshape(cube_values, (-1, self.__con, self.__con, self.__con))
 
         grad = compute_central_gradient3D(cube_values)
         grad = tf.reshape(grad, shape=(-1, 3, 1))
@@ -367,7 +365,9 @@ class SIFT:
         dot_ = tf.reshape(dot_, shape=(-1,))
         update_response = cube_values[:, 1, 1, 1] + 0.5 * dot_
 
-        kp_cond_2 = math.greater_equal(math.abs(update_response) * int(self.n_intervals), contrast_threshold)
+        kp_cond_2 = math.greater_equal(
+            math.abs(update_response) * int(self.n_intervals), self.__contrast_threshold - self.epsilon
+        )
 
         hess_xy = hess[:, :2, :2]
         hess_xy_trace = linalg.trace(hess_xy)
@@ -375,7 +375,7 @@ class SIFT:
 
         kp_cond_3 = math.logical_and(
             math.greater(hess_xy_det, 0.0),
-            math.less(eigen_ratio * (hess_xy_trace ** 2), ((eigen_ratio + 1) ** 2) * hess_xy_det)
+            math.less(self.__eigen_ration * (hess_xy_trace ** 2), ((self.__eigen_ration + 1) ** 2) * hess_xy_det)
         )
         sure_key_points = math.logical_and(math.logical_and(kp_cond_1, kp_cond_2), kp_cond_3)
 
@@ -385,8 +385,8 @@ class SIFT:
         if kp_extrema_update.shape[0] == 0:
             return next_step_cords, None
 
-        kp_cords = tf.cast(tf.boolean_mask(middle_pixel_cords, sure_key_points), dtype=self.DTYPE)
-        octave_index = tf.cast(octave_index, dtype=self.DTYPE)
+        kp_cords = tf.cast(tf.boolean_mask(middle_pixel_cords, sure_key_points), dtype=self.__DTYPE)
+        octave_index = tf.cast(octave_index, dtype=self.__DTYPE)
 
         ex, ey, ez = tf.unstack(kp_extrema_update, num=3, axis=1)
         cd, cy, cx, cz = tf.unstack(kp_cords, num=4, axis=1)
@@ -398,7 +398,7 @@ class SIFT:
         kp_octave = octave_index + cz * (2 ** 8) + tf.round((ez + 0.5) * 255.0) * (2 ** 16)
         kp_octave = tf.cast(kp_octave, dtype=tf.int32)
 
-        kp_size = self.sigma * (2 ** ((cz + ez) / tf.cast(self.n_intervals, dtype=self.DTYPE))) * (
+        kp_size = self.sigma * (2 ** ((cz + ez) / tf.cast(self.n_intervals, dtype=self.__DTYPE))) * (
                 2 ** (octave_index + 1.0))
         kp_response = math.abs(tf.boolean_mask(update_response, sure_key_points))
 
@@ -421,7 +421,7 @@ class SIFT:
         assert shape_[-1] == 3
         assert len(shape_) == 2
 
-        cond = math.less(math.reduce_max(math.abs(extrema), axis=-1), EXTREMA_OFFSET)
+        cond = math.less(math.reduce_max(math.abs(extrema), axis=-1), self.__extrema_offset)
 
         next_step_cords_temp = tf.boolean_mask(current_cords, ~cond)
 
@@ -449,11 +449,11 @@ class SIFT:
             key_point: KeyPoint
     ) -> tf.Tensor:
         octave = self.octave_pyramid[key_point.octave_id]
-        scale = SCALE_FACTOR * key_point.size / (2 ** (tf.cast(key_point.octave_id, dtype=self.DTYPE) + 1))
-        radius = tf.cast(tf.round(RADIUS * scale), dtype=tf.int32)
+        scale = self.__scale_factor * key_point.size / (2 ** (tf.cast(key_point.octave_id, dtype=self.__DTYPE) + 1))
+        radius = tf.cast(tf.round(self.__radius_factor * scale), dtype=tf.int32)
         weight_factor = -0.5 / (scale ** 2)
 
-        _prob = 1.0 / tf.cast(2 ** key_point.octave_id, dtype=self.DTYPE)
+        _prob = 1.0 / tf.cast(2 ** key_point.octave_id, dtype=self.__DTYPE)
         _one = tf.ones_like(_prob)
         _prob = tf.stack((_one, _prob, _prob, _one), axis=-1)
 
@@ -474,15 +474,15 @@ class SIFT:
         orientation = math.atan2(dx, dy) * (180.0 / PI)
 
         neighbor_index = make_neighborhood2D(tf.constant([[0, 0, 0, 0]], dtype=tf.int64), con=con - 2)
-        neighbor_index = tf.cast(tf.reshape(neighbor_index, shape=(1, con - 2, con - 2, 4)), dtype=self.DTYPE)
+        neighbor_index = tf.cast(tf.reshape(neighbor_index, shape=(1, con - 2, con - 2, 4)), dtype=self.__DTYPE)
         _, y, x, _ = tf.split(neighbor_index, [1, 1, 1, 1], axis=-1)
 
         weight = math.exp(weight_factor * (y ** 2 + x ** 2))
-        hist_index = tf.cast(tf.round(orientation * N_BINS / 360.), dtype=tf.int64)
-        hist_index = hist_index % N_BINS
+        hist_index = tf.cast(tf.round(orientation * self.__n_bins / 360.), dtype=tf.int64)
+        hist_index = hist_index % self.__n_bins
         hist_index = tf.reshape(hist_index, (-1, 1))
 
-        hist = tf.zeros(shape=(N_BINS,), dtype=self.DTYPE)
+        hist = tf.zeros(shape=(self.__n_bins,), dtype=self.__DTYPE)
         hist = tf.tensor_scatter_nd_add(hist, hist_index, tf.reshape(weight * magnitude, (-1,)))
         return hist
 
@@ -492,6 +492,6 @@ if __name__ == '__main__':
     img = tf.convert_to_tensor(tf.keras.utils.img_to_array(img), dtype=tf.float32)
     img = img[tf.newaxis, ...]
 
-    alg = SIFT()
-    alg.build_pyramid(img)
+    alg = SIFT(sigma=1.6)
+    alg.build_pyramid(img, num_octaves=4, num_intervals=5)
     kp = alg.extract_keypoints()
