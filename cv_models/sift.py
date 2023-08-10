@@ -29,9 +29,12 @@ SCALE_FACTOR = 1.5
 PEAK_RATIO = .8
 N_BINS = 36
 RADIUS = 3
+KeyPoint = namedtuple(f'KeyPoint', 'pt, size, angle, octave, octave_id, response')
+Octave = namedtuple('Octave', 'octave_id, base_X, gaus_X, dog_X')
 
 
 class KeyPointSift:
+
     def __init__(self):
         self.pt = tf.constant([[]], shape=(0, 4), dtype=DTYPE)
         self.size = tf.constant([[]], shape=(0,), dtype=DTYPE)
@@ -48,8 +51,7 @@ class KeyPointSift:
         assert isinstance(index, int)
         if index >= self.__len__():
             raise IndexError('Index out of range')
-        key_point = namedtuple(f'key_point_{index}', 'pt, size, angle, octave, octave_id, response')
-        ret = key_point(
+        ret = KeyPoint(
             pt=tf.reshape(self.pt[index], (1, 4)),
             size=self.size[index],
             angle=self.angle[index],
@@ -483,7 +485,115 @@ def localize_extrema(
     return next_step_cords, kp
 
 
-def main():
+def compute_histogram(
+        key_point: KeyPoint,
+        octave: Octave
+) -> tf.Tensor:
+    scale = SCALE_FACTOR * key_point.size / (2 ** (tf.cast(key_point.octave_id, dtype=DTYPE) + 1))
+    radius = tf.cast(tf.round(RADIUS * scale), dtype=tf.int32)
+    weight_factor = -0.5 / (scale ** 2)
+
+    _prob = 1.0 / tf.cast(2 ** key_point.octave_id, dtype=DTYPE)
+    _one = tf.ones_like(_prob)
+    _prob = tf.stack((_one, _prob, _prob, _one), axis=-1)
+
+    region_center = tf.cast(key_point.pt * _prob, dtype=tf.int64)
+
+    con = (radius * 2) + 3
+    block = make_neighborhood2D(region_center, con=con, origin_shape=octave.gaus_X.shape)
+
+    gaus_img = tf.gather_nd(octave.gaus_X, tf.reshape(block, shape=(-1, 4)))
+    gaus_img = tf.reshape(gaus_img, shape=(1, con, con, 1))
+    gaus_grad = compute_gradient_xy(gaus_img)
+
+    dx, dy = tf.split(gaus_grad, [1, 1], axis=-1)
+    magnitude = math.sqrt(dx * dx + dy * dy)
+    orientation = math.atan2(dx, dy) * (180.0 / PI)
+
+    neighbor_index = make_neighborhood2D(tf.constant([[0, 0, 0, 0]], dtype=tf.int64), con=con - 2)
+    neighbor_index = tf.cast(tf.reshape(neighbor_index, shape=(1, con - 2, con - 2, 4)), dtype=DTYPE)
+    _, y, x, _ = tf.split(neighbor_index, [1, 1, 1, 1], axis=-1)
+
+    weight = math.exp(weight_factor * (y ** 2 + x ** 2))
+    hist_index = tf.cast(tf.round(orientation * N_BINS / 360.), dtype=tf.int64)
+    hist_index = hist_index % N_BINS
+    hist_index = tf.reshape(hist_index, (-1, 1))
+
+    hist = tf.zeros(shape=(N_BINS,), dtype=DTYPE)
+    hist = tf.tensor_scatter_nd_add(hist, hist_index, tf.reshape(weight * magnitude, (-1,)))
+    return hist
+
+
+def compute_orientation(
+        key_points: KeyPointSift,
+        octaves: list[Octave]
+) -> KeyPointSift:
+    histogram = tf.constant([[]], shape=(0, N_BINS), dtype=DTYPE)
+
+    for k in range(len(key_points)):
+        curr_kp = key_points[k]
+        curr_octave = octaves[curr_kp.octave_id]
+        curr_hist = compute_histogram(curr_kp, curr_octave)
+        histogram = tf.concat((histogram, tf.reshape(curr_hist, shape=(1, -1))), axis=0)
+
+    gaussian1D = tf.constant([1, 4, 6, 4, 1], dtype=DTYPE) / 16.0
+    gaussian1D = tf.reshape(gaussian1D, shape=(-1, 1, 1))
+
+    histogram_pad = tf.pad(
+        tf.expand_dims(histogram, axis=-1),
+        paddings=tf.constant([[0, 0], [2, 2], [0, 0]], dtype=tf.int32),
+        mode='SYMMETRIC'
+    )
+
+    smooth_histogram = tf.nn.convolution(histogram_pad, gaussian1D, padding='VALID')
+    smooth_histogram = tf.squeeze(smooth_histogram, axis=-1)
+
+    orientation_max = tf.reduce_max(smooth_histogram, axis=-1)
+    value_cond = tf.repeat(tf.reshape(orientation_max, shape=(-1, 1)), repeats=N_BINS, axis=-1)
+    value_cond = value_cond * PEAK_RATIO
+
+    cond = math.logical_and(
+        math.greater(smooth_histogram, tf.roll(smooth_histogram, shift=1, axis=1)),
+        math.greater(smooth_histogram, tf.roll(smooth_histogram, shift=-1, axis=1))
+    )
+    cond = math.logical_and(
+        cond, math.greater_equal(smooth_histogram, value_cond)
+    )
+
+    peak_index = tf.where(cond)
+    peak_value = tf.boolean_mask(smooth_histogram, cond)
+
+    p_id, p_idx = tf.unstack(peak_index, num=2, axis=-1)
+
+    left_index = (p_idx - 1) % N_BINS
+    right_index = (p_idx + 1) % N_BINS
+
+    left_value = tf.gather_nd(smooth_histogram, tf.stack((p_id, left_index), axis=-1))
+    right_value = tf.gather_nd(smooth_histogram, tf.stack((p_id, right_index), axis=-1))
+
+    interpolated_peak_index = ((tf.cast(p_idx, dtype=DTYPE) + 0.5 * (left_value - right_value)) / (
+            left_value - (2 * peak_value) + right_value)) % N_BINS
+
+    orientation = 360. - interpolated_peak_index * 360. / N_BINS
+
+    orientation = tf.where(math.less(math.abs(orientation), 1e-7), 0.0, orientation)
+
+    key_points_new = KeyPointSift()
+
+    p_id = tf.reshape(p_id, (-1, 1))
+
+    key_points_new.add_key(
+        pt=tf.gather_nd(key_points.pt, p_id),
+        octave=tf.gather_nd(key_points.octave, p_id),
+        octave_id=tf.gather_nd(key_points.octave_id, p_id),
+        size=tf.gather_nd(key_points.size, p_id),
+        angle=orientation,
+        response=tf.gather_nd(key_points.response, p_id)
+    )
+    return key_points_new
+
+
+if __name__ == '__main__':
     img = tf.keras.utils.load_img('box.png', color_mode='grayscale')
     img = tf.convert_to_tensor(tf.keras.utils.img_to_array(img), dtype=DTYPE)
     img = img[tf.newaxis, ...]
@@ -496,8 +606,6 @@ def main():
     num_octaves = compute_default_N_octaves(image_shape=base_image.shape, min_shape=kernels_shape_[0])
     octave_capture = []
     key_points_capture = KeyPointSift()
-    octave_tup = namedtuple('octave', 'index, base, gaus_img, dog_image')
-
     octave_base = tf.identity(base_image)
 
     for i in tf.range(num_octaves):
@@ -511,165 +619,19 @@ def main():
         continue_search = compute_extrema(DOG_pyramid)
 
         for _ in tf.range(N_ATTEMPTS):
-            continue_search, _ = localize_extrema(continue_search, DOG_pyramid, i, keyPoint_pointer=key_points_capture)
+            continue_search, _ = localize_extrema(
+                continue_search, DOG_pyramid, i, keyPoint_pointer=key_points_capture
+            )
 
             if continue_search is None:
                 break
 
         octave_capture.append(
-            octave_tup(i, octave_base, octave_pyramid, DOG_pyramid)
+            Octave(i, octave_base, octave_pyramid, DOG_pyramid)
         )
 
         octave_base = tf.expand_dims(octave_pyramid[..., -3], axis=-1)
         _, Oh, Ow, _ = octave_base.get_shape()
         octave_base = tf.image.resize(octave_base, size=[Oh // 2, Ow // 2], method='nearest')
 
-    return_tup = namedtuple('main', 'img, gaussian_kernels, n_octaves, octave_cap, kp_cap')
-
-    return return_tup(img, gaus_kernels, num_octaves, octave_capture, key_points_capture)
-
-
-if __name__ == '__main__':
-    # array = np.array([
-    #     [
-    #         [
-    #             [8, 7, 3, 9, 10],
-    #             [-4, -5, 8, -2, 6],
-    #             [-8, 9, -3, 7, -1],
-    #             [-6, 5, 3, -7, 9],
-    #             [2, -4, 1, -8, 6],
-    #             [10, 0, -7, 2, -9],
-    #             [-3, 8, -1, 4, -6],
-    #             [-5, -2, 9, -6, 1],
-    #             [7, -3, 6, -5, 4]
-    #         ],
-    #         [
-    #             [-2, 4, -6, 8, -3],
-    #             [-7, 1, 9, -5, 2],
-    #             [3, -8, 5, -1, 7],
-    #             [6, -4, 2, -9, 3],
-    #             [-1, 7, -3, 6, -8],
-    #             [-9, 0, 8, -2, 4],
-    #             [5, -6, 3, -7, 1],
-    #             [-4, 9, -1, 5, -3],
-    #             [8, -5, 7, -4, 6]
-    #         ],
-    #         [
-    #             [6, -3, 7, -1, 8],
-    #             [-4, 9, -2, 6, -5],
-    #             [1, -7, 5, -3, 2],
-    #             [10, -6, 3, -8, 4],
-    #             [-5, 8, -1, 9, -4],
-    #             [0, -9, 7, -2, 6],
-    #             [3, -2, 4, -7, 5],
-    #             [-6, 1, -8, 3, -9],
-    #             [9, -4, 6, -5, 7]
-    #         ],
-    #         [
-    #             [-1, 5, -9, 3, -7],
-    #             [7, -3, 8, -4, 6],
-    #             [-8, 2, -6, 9, -1],
-    #             [4, -7, 1, -8, 3],
-    #             [-3, 6, 0, 7, -5],
-    #             [9, -1, 5, -6, 2],
-    #             [-5, 8, -2, 4, -9],
-    #             [6, -4, 7, -3, 1],
-    #             [-2, 9, -5, 8, -6]
-    #         ],
-    #         [
-    #             [8, -2, 7, -3, 6],
-    #             [-6, 9, -1, 8, -4],
-    #             [2, -8, 5, -7, 3],
-    #             [-4, 7, -3, 6, -5],
-    #             [1, -9, 0, 9, -2],
-    #             [10, -5, 8, -6, 4],
-    #             [-7, 3, -2, 7, -8],
-    #             [5, -6, 9, -1, 2],
-    #             [-3, 8, -4, 5, -9]
-    #         ],
-    #         [
-    #             [-9, 3, -7, 4, -8],
-    #             [5, -1, 8, -6, 2],
-    #             [-2, 7, -4, 9, -3],
-    #             [0, -8, 2, -7, 5],
-    #             [6, -5, 1, -9, 3],
-    #             [-3, 9, -6, 7, -1],
-    #             [10, -4, 8, -5, 6],
-    #             [-7, 2, -3, 6, -9],
-    #             [4, -7, 5, -4, 8]
-    #         ],
-    #         [
-    #             [2, -6, 7, -8, 3],
-    #             [-4, 8, -1, 6, -5],
-    #             [10, -3, 5, -9, 1],
-    #             [-7, 4, -2, 9, -6],
-    #             [0, -8, 3, -7, 2],
-    #             [9, -5, 7, -4, 6],
-    #             [-1, 6, -3, 8, -2],
-    #             [8, -7, 9, -6, 5],
-    #             [-9, 2, -4, 7, -3]
-    #         ],
-    #         [
-    #             [-8, 2, -6, 7, -9],
-    #             [3, -7, 9, -5, 1],
-    #             [-4, 8, -2, 6, -3],
-    #             [10, -1, 7, -8, 5],
-    #             [-5, 9, -3, 4, -6],
-    #             [-2, 7, -4, 9, -1],
-    #             [8, -5, 6, -3, 7],
-    #             [-4, 9, -1, 5, -3],
-    #             [8, -5, 7, -4, 6]
-    #         ],
-    #         [
-    #             [-6, 3, -7, 4, -8],
-    #             [5, -2, 8, -6, 2],
-    #             [-1, 7, -4, 9, -3],
-    #             [-5, 8, -2, 7, -4],
-    #             [-3, 6, -1, 5, -2],
-    #             [10, -7, 9, -8, 6],
-    #             [-7, 1, -3, 4, -6],
-    #             [2, -5, 7, -4, 3],
-    #             [8, -6, 9, -7, 5]
-    #         ]
-    #     ]
-    # ])
-
-    cap = main()
-
-    octave_cap = cap.octave_cap
-    kp_cap = cap.kp_cap
-
-    # scale = SCALE_FACTOR * size / (2 ** (tf.cast(octave_index, dtype=DTYPE) + 1))
-    # radius = tf.cast(tf.round(RADIUS * scale), dtype=tf.int32)
-    # weight_factor = -0.5 / (scale ** 2)
-    # _prob = 1.0 / tf.cast(2 ** octave_index, dtype=DTYPE)
-    # _one = tf.ones_like(_prob)
-    # _prob = tf.stack((_one, _prob, _prob, _one), axis=-1)
-    # region_center = tf.cast(pt * _prob, dtype=tf.int64)
-    # for k in range(len(kp_cap)):
-    #     octave_ = octave_cap[kp_cap.octave_index[k]]
-    #     con = (kp_cap.radius[k] * 2) + 3
-    #     block = make_neighborhood2D(
-    #         tf.reshape(kp_cap.region_center[k], shape=(1, 4)), con=con, origin_shape=octave_.gaus_img.shape
-    #     )
-    #     gaus_img = tf.gather_nd(octave_.gaus_img, tf.reshape(block, shape=(-1, 4)))
-    #     gaus_img = tf.reshape(gaus_img, shape=(1, con, con, 1))
-    #     gaus_grad = compute_gradient_xy(gaus_img)
-    #
-    #     dx, dy = tf.split(gaus_grad, [1, 1], axis=-1)
-    #     magnitude = math.sqrt(dx * dx + dy * dy)
-    #     orientation = math.atan2(dx, dy) * (180.0 / PI)
-    #
-    #     neighbor_index = make_neighborhood2D(tf.constant([[0, 0, 0, 0]], dtype=tf.int64), con=con - 2)
-    #     neighbor_index = tf.cast(tf.reshape(neighbor_index, shape=(1, con - 2, con - 2, 4)), dtype=DTYPE)
-    #     _, i, j, _ = tf.split(neighbor_index, [1, 1, 1, 1], axis=-1)
-    #
-    #     weight = math.exp(kp_cap.weight_factor[k] * (i ** 2 + j ** 2))
-    #     histogram_index = tf.cast(tf.round(orientation * N_BINS / 360.), dtype=tf.int64)
-    #     histogram_index = histogram_index % N_BINS
-    #     histogram_index = tf.reshape(histogram_index, (-1, 1))
-    #
-    #     hist = tf.zeros(shape=(N_BINS,), dtype=DTYPE)
-    #     hist = tf.tensor_scatter_nd_add(hist, histogram_index, tf.reshape(weight * magnitude, (-1,)))
-    #
-    #     kp_cap.histogram = tf.concat((kp_cap.histogram, tf.reshape(hist, shape=(1, -1))), axis=0)
+    keyPoints = compute_orientation(key_points_capture, octave_capture)
