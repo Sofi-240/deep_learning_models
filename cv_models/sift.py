@@ -20,7 +20,7 @@ KeyPoint = namedtuple(f'KeyPoint', 'pt, size, angle, octave, octave_id, response
 Octave = namedtuple('Octave', 'octave_id, gaus_X, dog_X')
 
 
-class KeyPointSift:
+class KeyPointsSift:
 
     def __init__(self):
         self.__DTYPE = backend.floatx()
@@ -30,10 +30,10 @@ class KeyPointSift:
         self.octave = tf.constant([[]], shape=(0,), dtype=tf.int32)
         self.octave_id = tf.constant([[]], shape=(0,), dtype=tf.int32)
         self.response = tf.constant([[]], shape=(0,), dtype=self.__DTYPE)
+        self.__n = 0
 
     def __len__(self):
-        _shape = self.pt.get_shape()
-        return _shape[0]
+        return self.__n
 
     def __getitem__(self, index):
         assert isinstance(index, int)
@@ -63,13 +63,13 @@ class KeyPointSift:
 
         self.__dict__.update(**temp)
 
-    def add_key(self,
-                pt: Union[tf.Tensor, list, tuple],
-                size: Union[tf.Tensor, float],
-                angle: Union[tf.Tensor, float] = 0.0,
-                octave: Union[tf.Tensor, int] = 0,
-                octave_id: Union[tf.Tensor, int] = 0,
-                response: Union[tf.Tensor, float] = -1.0):
+    def add_keys(self,
+                 pt: Union[tf.Tensor, list, tuple],
+                 size: Union[tf.Tensor, float],
+                 angle: Union[tf.Tensor, float] = 0.0,
+                 octave: Union[tf.Tensor, int] = 0,
+                 octave_id: Union[tf.Tensor, int] = 0,
+                 response: Union[tf.Tensor, float] = -1.0):
         if isinstance(size, float):
             size = tf.convert_to_tensor([size])
 
@@ -111,6 +111,11 @@ class KeyPointSift:
         response = tf.cast(response, dtype=self.__DTYPE)
         self.response = tf.concat((self.response, response), axis=0)
 
+        self.__n += int(n_points_)
+
+    def remove_duplicate(self):
+        return
+
 
 class SIFT:
 
@@ -138,7 +143,7 @@ class SIFT:
         self.n_octaves = None
         self.n_intervals = tf.cast(n_intervals, dtype=tf.int32)
         self.sigma = tf.cast(sigma, dtype=self.__DTYPE)
-        self.key_points = KeyPointSift()
+        self.key_points = KeyPointsSift()
         self.border_width = (3, 3, 0)
 
     def build_pyramid(
@@ -221,9 +226,9 @@ class SIFT:
             self,
             n_iterations: Union[tf.Tensor, int] = 5,
             contrast_threshold: Union[tf.Tensor, float] = 0.04
-    ) -> KeyPointSift:
+    ) -> KeyPointsSift:
 
-        temp_key_point = KeyPointSift()
+        temp_key_point = KeyPointsSift()
 
         n_iterations = int(n_iterations)
         threshold = tf.floor(0.5 * contrast_threshold / 3.0 * 255.0)
@@ -254,7 +259,7 @@ class SIFT:
             else:
                 histogram = tf.concat((histogram, tf.reshape(curr_hist, shape=(1, -1))), axis=0)
 
-        if del_points is not None:
+        if del_points:
             for p in range(len(del_points)):
                 del temp_key_point[del_points[p] - p]
 
@@ -302,14 +307,10 @@ class SIFT:
 
         p_id = tf.reshape(p_id, (-1, 1))
 
-        self.key_points.add_key(
-            pt=tf.gather_nd(temp_key_point.pt, p_id),
-            octave=tf.gather_nd(temp_key_point.octave, p_id),
-            octave_id=tf.gather_nd(temp_key_point.octave_id, p_id),
-            size=tf.gather_nd(temp_key_point.size, p_id),
-            angle=orientation,
-            response=tf.gather_nd(temp_key_point.response, p_id)
-        )
+        self.key_points.add_keys(pt=tf.gather_nd(temp_key_point.pt, p_id), size=tf.gather_nd(temp_key_point.size, p_id),
+                                 angle=orientation, octave=tf.gather_nd(temp_key_point.octave, p_id),
+                                 octave_id=tf.gather_nd(temp_key_point.octave_id, p_id),
+                                 response=tf.gather_nd(temp_key_point.response, p_id))
         return self.key_points
 
     def compute_default_N_octaves(
@@ -333,8 +334,8 @@ class SIFT:
             middle_pixel_cords: tf.Tensor,
             dOg_array: tf.Tensor,
             octave_index: Union[int, float],
-            keyPoint_pointer: Union[KeyPointSift, None] = None
-    ) -> tuple[Union[tf.Tensor, None], Union[tuple, None, KeyPointSift]]:
+            keyPoint_pointer: Union[KeyPointsSift, None] = None
+    ) -> tuple[Union[tf.Tensor, None], Union[tuple, None, KeyPointsSift]]:
         dog_shape_ = dOg_array.shape
 
         cube_neighbor = make_neighborhood3D(middle_pixel_cords, con=self.__con, origin_shape=dog_shape_)
@@ -403,10 +404,8 @@ class SIFT:
         kp_response = math.abs(tf.boolean_mask(update_response, sure_key_points))
 
         if keyPoint_pointer is not None:
-            keyPoint_pointer.add_key(
-                pt=kp_pt, octave=kp_octave, size=kp_size, response=kp_response,
-                octave_id=tf.cast(octave_index, dtype=tf.int32)
-            )
+            keyPoint_pointer.add_keys(pt=kp_pt, size=kp_size, octave=kp_octave,
+                                      octave_id=tf.cast(octave_index, dtype=tf.int32), response=kp_response)
             return next_step_cords, keyPoint_pointer
         kp = namedtuple('KeyPoint', 'pt, octave, o_size, response, octave_index')
         kp = kp(kp_pt, kp_octave, kp_size, kp_response, tf.cast(octave_index, dtype=tf.int32))
