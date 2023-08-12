@@ -41,7 +41,8 @@ class KeyPointsSift:
         return self.key_points[self.__i - 1]
 
     def __getitem__(self, index):
-        if not isinstance(index, (int, slice)):
+        if not isinstance(index, (int, slice)) or not (
+                isinstance(index, (list, tuple)) and isinstance(index[0], (list, tuple))):
             raise KeyError(f'{index}')
         return self.key_points[index]
 
@@ -56,11 +57,31 @@ class KeyPointsSift:
         for val in prev_values:
             left, _, right = tf.split(val, [index, 1, prev_len - index - 1], axis=0)
             ret_values.append(tf.concat((left, right), axis=0))
-
         self.__backend = ret_values
+
         if self.__key_built:
             left, _, right = np.hsplit(self.__key_points, [index, index + 1])
             self.__key_points = np.hstack((left, right))
+
+    def __remove_with_mask(self, mask):
+        if isinstance(mask, (list, tuple)):
+            bool_ = isinstance(mask[0], (list, tuple))
+            for ind in mask:
+                ind = ind[0] if bool_ else ind
+                assert isinstance(ind, int)
+                del self[ind]
+            return
+        if not isinstance(mask, np.ndarray) and not isinstance(mask.dtype, bool):
+            raise ValueError
+        self.__key_points = self.__key_points[mask]
+        indices = tf.convert_to_tensor(mask, dtype=tf.bool)
+        prev_values = self.__backend
+        ret_values = []
+
+        for val in prev_values:
+            ret_values.append(tf.boolean_mask(val, indices, axis=0))
+
+        self.__backend = ret_values
 
     @property
     def __backend(self):
@@ -182,21 +203,10 @@ class KeyPointsSift:
         indices = np.ones(_kp.shape, dtype=bool)
         prev_kp = flatten[0][1]
         for eq, k, p in flatten[1:]:
-            if prev_kp == k:
-                print(p)
             indices[p] = (prev_kp != k)
             prev_kp = k
 
-        self.__key_points = _kp[indices]
-        indices = tf.convert_to_tensor(indices, dtype=tf.bool)
-
-        prev_values = self.__backend
-        ret_values = []
-
-        for val in prev_values:
-            ret_values.append(tf.boolean_mask(val, indices, axis=0))
-
-        self.__backend = ret_values
+        self.__remove_with_mask(indices)
 
     class KeyPoint:
         def __init__(self, pt, size, angle=0.0, octave=0, octave_id=0, response=-1.0):
@@ -336,7 +346,6 @@ if __name__ == '__main__':
                         octave_id=tf.convert_to_tensor(temp['_octave_id'][20:]),
                         response=tf.convert_to_tensor(temp['_response'][20:]))
     assert len(key_points.key_points) == 72
-
 
     key_points.remove_duplicate()
     # assert len(key_points.key_points) == 67
