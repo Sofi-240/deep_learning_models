@@ -11,110 +11,350 @@ from collections import namedtuple
 
 math = tf.math
 linalg = tf.linalg
+bitwise_ops = tf.bitwise
 
 backend.set_floatx('float32')
 # https://www.cs.ubc.ca/~lowe/papers/ijcv04.pdf
 
 
-KeyPoint = namedtuple(f'KeyPoint', 'pt, size, angle, octave, octave_id, response')
 Octave = namedtuple('Octave', 'octave_id, gaus_X, dog_X')
 
 
 class KeyPointsSift:
+    __DTYPE = backend.floatx()
 
-    def __init__(self):
-        self.__DTYPE = backend.floatx()
-        self.pt = tf.constant([[]], shape=(0, 4), dtype=self.__DTYPE)
-        self.size = tf.constant([[]], shape=(0,), dtype=self.__DTYPE)
-        self.angle = tf.constant([[]], shape=(0,), dtype=self.__DTYPE)
-        self.octave = tf.constant([[]], shape=(0,), dtype=tf.int32)
-        self.octave_id = tf.constant([[]], shape=(0,), dtype=tf.int32)
-        self.response = tf.constant([[]], shape=(0,), dtype=self.__DTYPE)
-        self.__n = 0
+    def __init__(self, name: Union[str, None] = None, as_size_image: bool = False, initial_size=None):
+        self.name = name or 'KeyPointsSift'
+        self.pt = None
+        self.size = None
+        self.angle = None
+        self.octave = None
+        self.octave_id = None
+        self.response = None
+        self.__key_points = np.array([], dtype=object)
+        self.size_image = as_size_image
+        self.initial_size = initial_size
 
     def __len__(self):
-        return self.__n
+        if self.pt is None:
+            return 0
+        return int(self.pt.get_shape()[0])
 
-    def __getitem__(self, index):
-        assert isinstance(index, int)
-        if index >= self.__len__():
-            raise IndexError('Index out of range')
-        ret = KeyPoint(
-            pt=tf.reshape(self.pt[index], (1, 4)),
-            size=self.size[index],
-            angle=self.angle[index],
-            octave=self.octave[index],
-            octave_id=self.octave_id[index],
-            response=self.response[index]
-        )
-        return ret
+    def __getitem__(self, indices: Union[int, slice, list, tuple]):
+        if not isinstance(indices, (int, slice)) or (
+                isinstance(indices, (list, tuple)) and not isinstance(indices[0], (list, tuple))):
+            raise KeyError(f'{indices}')
+        return self.key_points[indices]
 
-    def __delitem__(self, index):
-        assert isinstance(index, int)
-        if index >= self.__len__():
-            raise IndexError('Index out of range')
+    @property
+    def __backend(self):
+        arrays = [
+            self.pt, self.size, self.angle, self.octave, self.octave_id, self.response
+        ]
+        return arrays
 
-        temp = {}
-        prev_len = self.__len__()
-        for key, val in self.__dict__.items():
-            if isinstance(val, tf.Tensor) and int(tf.shape(val)[0]) == prev_len:
-                left, _, right = tf.split(val, [index, 1, prev_len - index - 1], axis=0)
-                temp[key] = tf.concat((left, right), axis=0)
+    @__backend.setter
+    def __backend(self, values):
+        self.pt, self.size, self.angle, self.octave, self.octave_id, self.response = values
 
-        self.__dict__.update(**temp)
+    @property
+    def key_points(self):
+        _len = len(self)
+        _keys_len = len(self.__key_points)
+        if _len == _keys_len:
+            return self.__key_points
+        diff = _len - _keys_len
+        split_index = [_keys_len] + [1] * diff
+        backend_arr = self.__backend
+        splits = [
+            tf.split(arr, split_index, axis=0)[1:] for arr in backend_arr
+        ]
+        for index, split in enumerate(zip(*splits)):
+            key = self.KeyPoint(
+                pt=split[0], size=split[1], angle=split[2], octave=split[3], octave_id=split[4], response=split[5],
+                as_size_image=self.size_image
+            )
+            self.__key_points = np.append(self.__key_points, key)
+        return self.__key_points
 
-    def add_keys(self,
-                 pt: Union[tf.Tensor, list, tuple],
-                 size: Union[tf.Tensor, float],
-                 angle: Union[tf.Tensor, float] = 0.0,
-                 octave: Union[tf.Tensor, int] = 0,
-                 octave_id: Union[tf.Tensor, int] = 0,
-                 response: Union[tf.Tensor, float] = -1.0):
-        if isinstance(size, float):
-            size = tf.convert_to_tensor([size])
+    def __concat_with_backend(self, values):
+        backend_values = self.__backend
+        backend_ret = [
+            tf.concat((bv, v), axis=0) for bv, v in zip(backend_values, values)
+        ]
+        self.__backend = backend_ret
 
-        n_points_ = max(size.shape)
+    def __pack_backend(self):
+        pt, size, angle, octave, octave_id, response = self.__backend
+
+        octave = tf.cast(octave, dtype=self.__DTYPE)
+        octave_id = tf.cast(octave_id, dtype=self.__DTYPE)
+
+        concat_ = [pt] + [tf.reshape(a, (-1, 1)) for a in [size, angle, octave, octave_id, response]]
+
+        arr = tf.concat(concat_, axis=1)
+        return arr
+
+    def __unpack_backend(self, arr, set_backend=True):
+        pt, size, angle, octave, octave_id, response = tf.split(arr, [4, 1, 1, 1, 1, 1], axis=-1)
+        octave = tf.cast(octave, dtype=tf.int32)
+        octave_id = tf.cast(octave_id, dtype=tf.int32)
+        ret = [pt] + [tf.reshape(a, (-1,)) for a in [size, angle, octave, octave_id, response]]
+        if set_backend:
+            self.__backend = [pt] + [tf.reshape(a, (-1,)) for a in [size, angle, octave, octave_id, response]]
+        else:
+            return ret
+
+    def add_keys(
+            self,
+            pt: Union[tf.Tensor, list, tuple],
+            size: Union[tf.Tensor, float],
+            angle: Union[tf.Tensor, float] = 0.0,
+            octave: Union[tf.Tensor, int] = 0,
+            octave_id: Union[tf.Tensor, int] = 0,
+            response: Union[tf.Tensor, float] = -1.0
+    ):
+
+        size = tf.cast(tf.reshape(size, shape=(-1,)), dtype=self.__DTYPE)
+        n_points_ = int(tf.shape(size)[0])
+        pt = tf.cast(tf.reshape(pt, shape=(-1, 4)), dtype=self.__DTYPE)
+        if int(tf.shape(pt)[0]) != n_points_:
+            raise ValueError
 
         def map_args(arg):
             if not isinstance(arg, tf.Tensor):
-                return tf.convert_to_tensor([arg] * n_points_)
-            shape_ = arg.shape
-            n_dim = len(shape_)
-            assert n_dim <= 2
-            if n_dim == 0 or (n_dim == 1 and shape_[0] == 1):
-                arg = tf.get_static_value(arg)
-                arg = arg[0] if isinstance(arg, np.ndarray) else arg
-                return tf.convert_to_tensor([arg] * n_points_)
+                return tf.constant([arg] * n_points_)
             arg = tf.reshape(arg, shape=(-1,))
+            shape_ = tf.shape(arg)[0]
+            if shape_ == 1 and n_points_ > 1:
+                return tf.repeat(arg, repeats=n_points_, axis=0)
             assert arg.shape[0] == n_points_
             return arg
-
-        pt = tf.cast(tf.reshape(pt, shape=(-1, 4)), dtype=self.__DTYPE)
-        assert pt.shape[0] == n_points_
-        self.pt = tf.concat((self.pt, pt), axis=0)
-
-        size = tf.cast(tf.reshape(size, shape=(-1,)), dtype=self.__DTYPE)
-        self.size = tf.concat((self.size, size), axis=0)
 
         args = [angle, octave, octave_id, response]
         angle, octave, octave_id, response = list(map(map_args, args))
 
         angle = tf.cast(angle, dtype=self.__DTYPE)
-        self.angle = tf.concat((self.angle, angle), axis=0)
-
         octave = tf.cast(octave, dtype=tf.int32)
-        self.octave = tf.concat((self.octave, octave), axis=0)
-
         octave_id = tf.cast(octave_id, dtype=tf.int32)
-        self.octave_id = tf.concat((self.octave_id, octave_id), axis=0)
-
         response = tf.cast(response, dtype=self.__DTYPE)
-        self.response = tf.concat((self.response, response), axis=0)
 
-        self.__n += int(n_points_)
+        wrap = [pt, size, angle, octave, octave_id, response]
+        if self.pt is None:
+            self.__backend = wrap
+        else:
+            self.__concat_with_backend(wrap)
 
     def remove_duplicate(self):
-        return
+        _kp = self.key_points
+        flatten = [
+            (float(_kp[i].cmp_to_other(_kp[i + 1])), _kp[i], i + 1) for i in range(len(_kp) - 1)
+        ]
+
+        assert isinstance(flatten, list)
+        flatten.sort(key=lambda tup: tup[0])
+
+        mask = np.ones(_kp.shape, dtype=bool)
+        prev_kp = flatten[0][1]
+        for eq, k, p in flatten[1:]:
+            mask[p] = (prev_kp != k)
+            prev_kp = k
+
+        self.__key_points = self.__key_points[mask]
+        mask = tf.constant(mask, dtype=tf.bool)
+        prev_values = self.__pack_backend()
+        prev_values = tf.boolean_mask(prev_values, mask, axis=0)
+        self.__unpack_backend(prev_values)
+
+    def remove_keys(self, indices):
+        if not isinstance(indices, (int, list, tuple)):
+            raise ValueError('expected indices to be type of (int, list, tuple, np.ndarray, tf.Tensor)')
+        _type = type(indices)
+        tf_vals = self.__pack_backend()
+
+        if _type == int:
+            left, _, right = tf.split(tf_vals, [indices, 1, len(self) - indices - 1], axis=0)
+            tf_vals = tf.concat((left, right), axis=0)
+            self.__unpack_backend(tf_vals)
+            left, _, right = np.hsplit(self.__key_points, [indices, indices + 1])
+            self.__key_points = np.hstack((left, right))
+        elif _type == list or _type == tuple:
+            mask = [True] * len(self)
+            prev_ind = 0
+            indices.sort()
+
+            for i, ind in enumerate(indices):
+                if isinstance(ind, (list, tuple)): ind = ind[0]
+                if not isinstance(ind, int): raise TypeError(f'expected type of int got {type(ind)}')
+                if ind - prev_ind == 0 and ind != 0: continue
+                mask[ind] = False
+                prev_ind = ind
+
+            tf_vals = tf.boolean_mask(tf_vals, tf.constant(mask, dtype=tf.bool))
+            self.__unpack_backend(tf_vals)
+            self.__key_points = self.__key_points[np.array(mask, dtype=bool)]
+
+    def pack_values(self):
+        values_order = ['pt', 'size', 'angle', 'octave', 'octave_id', 'response']
+        return self.__pack_backend(), values_order
+
+    def unpack_values(self, values):
+        return self.__unpack_backend(values, set_backend=False)
+
+    def as_size_image(self):
+        if self.size_image:
+            return None
+        pt = self.pt * tf.constant([1.0, 0.5, 0.5, 1.0], dtype=self.pt.dtype)
+        size = self.size * 0.5
+        octave = bitwise_ops.bitwise_xor(self.octave, 255)
+        new = type(self)(f'{self.name}_2', True, self.initial_size)
+        new.add_keys(
+            pt=pt, size=size, octave=octave, octave_id=tf.identity(self.octave_id),
+            angle=tf.identity(self.angle), response=tf.identity(self.response)
+        )
+        return new
+
+    class KeyPoint:
+        def __init__(
+                self,
+                pt: tf.Tensor,
+                size: tf.Tensor,
+                angle: Union[tf.Tensor, float] = 0.0,
+                octave: Union[tf.Tensor, int] = 0,
+                octave_id: Union[tf.Tensor, int] = 0,
+                response: Union[tf.Tensor, float] = -1.0,
+                as_size_image: bool = False
+        ):
+            self.pt = tf.cast(pt, dtype=tf.float32)
+            self.size = tf.cast(size, dtype=tf.float32)
+            self.angle = tf.cast(angle, dtype=tf.float32)
+            self.octave = tf.cast(octave, dtype=tf.int32)
+            self.octave_id = tf.cast(octave_id, dtype=tf.int32)
+            self.response = tf.cast(response, dtype=tf.float32)
+            self.size_image = as_size_image
+
+        def __eq__(self, other):
+            if not isinstance(other, type(self)):
+                raise TypeError
+            if tf.reduce_max(tf.abs(self.pt - other.pt)) != 0: return False
+            if self.size != other.size: return False
+            if self.angle != other.angle: return False
+            if self.response != other.response: return False
+            if self.octave != other.octave: return False
+            if self.octave_id != other.octave_id: return False
+            return True
+
+        def cmp_to_other(self, other):
+            if not isinstance(other, type(self)):
+                raise ValueError
+            p1 = tf.unstack(self.pt, num=4, axis=-1)
+            p2 = tf.unstack(other.pt, num=4, axis=-1)
+
+            if p1[0] != p2[0]: return p1[0] - p2[0]
+            if p1[1] != p2[1]: return p1[1] - p2[1]
+            if p1[2] != p2[2]: return p1[2] - p2[2]
+            if p1[3] != p2[3]: return p1[3] - p2[3]
+            if self.size != other.size: return self.size - other.size
+            if self.angle != other.angle: return self.angle - other.angle
+            if self.response != other.response: return self.response - other.response
+            if self.octave != other.octave: return self.octave - other.octave
+            return self.octave_id - other.octave_id
+
+        @property
+        def unpacked_octave(self):
+            if not self.size_image:
+                return None
+            octave = bitwise_ops.bitwise_and(self.octave, 255)
+            layer = bitwise_ops.right_shift(self.octave, 8) & 255
+            if octave >= 128: octave = bitwise_ops.bitwise_or(octave, -128)
+            scale = 1 / tf.bitwise.left_shift(1, octave) if octave >= 1 else tf.bitwise.left_shift(1, -octave)
+            return tf.concat([tf.cast(a[..., tf.newaxis], dtype=tf.float32) for a in [octave, layer, scale]], axis=1)
+
+        def as_size_image(self):
+            pt = self.pt * tf.constant([1.0, 0.5, 0.5, 1.0], dtype=self.pt.dtype)
+            size = self.size * 0.5
+            octave = (self.octave & ~255) | ((self.octave - 1) & 255)
+            return type(self)(pt, size, self.angle, octave, self.octave_id, self.response)
+
+        def descriptors(self, gaussian_image: tf.Tensor, num_bins: int = 8, window_width: float = 4.0,
+                        scale_multiplier: float = 3):
+            # if not self.size_image:
+            #     return None
+            # _shape = tf.shape(gaussian_image)
+            # up_octave = self.unpacked_octave
+            # octave, layer, scale = tf.split(up_octave, [1, 1, 1], axis=1)
+            # scale_pad = tf.pad(tf.repeat(scale, 2, axis=0), paddings=tf.constant([[0, 0], [1, 1]]), constant_values=1.0)
+            # point = tf.cast(tf.round(self.pt * scale), dtype=tf.int64)
+            # bins_per_degree = num_bins / 360.
+            # angle = 360. - self.angle
+            # cos_angle = math.cos((PI / 180) * angle)
+            # sin_angle = math.sin((PI / 180) * angle)
+            # weight_multiplier = -0.5 / ((0.5 * window_width) ** 2)
+            #
+            # hist_width = scale_multiplier * 0.5 * tf.reshape(scale, (-1,)) * self.size
+            #
+            # hist_width = tf.cast(
+            #     tf.round(
+            #         hist_width * math.sqrt(2.0) * (window_width + 1.0) * 0.5
+            #     ), dtype=tf.int32
+            # )
+            #
+            # hist_width = math.minimum(hist_width, tf.reduce_max(_shape))
+            # oc = alg.octave_pyramid[0]
+            #
+            # point, cos_angle, sin_angle, weight_multiplier, hist_width = k1.descriptors(oc.gaus_X)
+            #
+            # cords = make_neighborhood2D(point, con=int(hist_width * 2), origin_shape=oc.gaus_X.shape)
+            #
+            # gaus_img = tf.gather_nd(oc.gaus_X, tf.reshape(cords, shape=(-1, 4)))
+            # gaus_img = tf.reshape(gaus_img, shape=(1, int(hist_width * 2), int(hist_width * 2), 1))
+            #
+            # gaus_grad = compute_central_gradient2D(gaus_img)
+            #
+            # dx, dy = tf.split(gaus_grad, [1, 1], axis=-1)
+            # magnitude = tf.reshape(math.sqrt(dx * dx + dy * dy), (-1,))
+            # orientation = tf.reshape((math.atan2(dx, dy) * (180.0 / PI)) % 360, (-1,))
+            #
+            # block_ = make_neighborhood2D(tf.constant([[0, 0, 0, 0]], dtype=tf.int64), con=int((hist_width - 1) * 2))
+            # block_ = tf.cast(block_, dtype=tf.float32)
+            # block_ = tf.reshape(block_, (-1, 4))
+            # _, y, x, _ = tf.split(block_, [1, 1, 1, 1], axis=-1)
+            #
+            # y_rot = x * sin_angle + y * cos_angle
+            # x_rot = x * cos_angle - y * sin_angle
+            # y_bin = (y_rot / hist_width) + 0.5 * 4 - 0.5
+            # x_bin = (x_rot / hist_width) + 0.5 * 4 - 0.5
+            #
+            # hist_width = tf.cast(hist_width, dtype=tf.float32)
+            #
+            # weight = math.exp(weight_multiplier * ((y_rot / hist_width) ** 2 + (x_rot / hist_width) ** 2))
+            #
+            # orientation_frac_ = orientation - math.floor(orientation)
+            # orientation_frac_ = tf.reshape(orientation_frac_, (-1,))
+            # y_bin_frac_ = y_bin - math.floor(y_bin)
+            # x_bin_frac_ = x_bin - math.floor(x_bin)
+            #
+            # orientation_bin_floor = math.floor(orientation)
+            # orientation_bin_floor_plus = orientation_bin_floor + 8
+            # orientation_bin_floor = tf.where(
+            #     math.logical_and(orientation_bin_floor < 0, orientation_bin_floor_plus < 8), orientation_bin_floor_plus,
+            #     orientation_bin_floor)
+            #
+            # c1 = magnitude * y_bin_frac_
+            # c0 = magnitude * (1 - y_bin_frac_)
+            # c11 = c1 * x_bin_frac_
+            # c10 = c1 * (1 - x_bin_frac_)
+            # c01 = c0 * x_bin_frac_
+            # c00 = c0 * (1 - x_bin_frac_)
+            # c111 = c11 * orientation_frac_
+            # c110 = c11 * (1 - orientation_frac_)
+            # c101 = c10 * orientation_frac_
+            # c100 = c10 * (1 - orientation_frac_)
+            # c011 = c01 * orientation_frac_
+            # c010 = c01 * (1 - orientation_frac_)
+            # c001 = c00 * orientation_frac_
+            # c000 = c00 * (1 - orientation_frac_)
+            return
 
 
 class SIFT:
@@ -137,7 +377,6 @@ class SIFT:
         self.__con = 3
         self.epsilon = 1e-05
         self.octave_pyramid = []
-        self.input = None
         self.X_base = None
         self.gaussian_kernels = None
         self.n_octaves = None
@@ -145,6 +384,7 @@ class SIFT:
         self.sigma = tf.cast(sigma, dtype=self.__DTYPE)
         self.key_points = KeyPointsSift()
         self.border_width = (3, 3, 0)
+        self.__gauss_shapes = []
 
     def build_pyramid(
             self,
@@ -160,6 +400,7 @@ class SIFT:
             raise ValueError(
                 'expected the inputs to be grayscale images with size of (None, h, w, 1)'
             )
+        self.key_points.initial_size = _shape
         b, h, w, d = tf.unstack(_shape, num=4, axis=-1)
         self.sigma = tf.cast(sigma, dtype=self.__DTYPE)
         self.n_intervals = tf.cast(num_intervals, dtype=self.__DTYPE)
@@ -218,6 +459,7 @@ class SIFT:
             octave_base = tf.image.resize(gaussian_X[-3], size=[Oh // 2, Ow // 2], method='nearest')
 
             gaussian_X = tf.concat(gaussian_X, axis=-1)
+            self.__gauss_shapes.append(tf.shape(gaussian_X))
             DOG_X = tf.concat(DOG_X, axis=-1)
 
             self.octave_pyramid.append(Octave(oc, gaussian_X, DOG_X))
@@ -259,9 +501,7 @@ class SIFT:
             else:
                 histogram = tf.concat((histogram, tf.reshape(curr_hist, shape=(1, -1))), axis=0)
 
-        if del_points:
-            for p in range(len(del_points)):
-                del temp_key_point[del_points[p] - p]
+        temp_key_point.remove_keys(del_points)
 
         gaussian1D = tf.constant([1, 4, 6, 4, 1], dtype=self.__DTYPE) / 16.0
         gaussian1D = tf.reshape(gaussian1D, shape=(-1, 1, 1))
@@ -307,10 +547,17 @@ class SIFT:
 
         p_id = tf.reshape(p_id, (-1, 1))
 
-        self.key_points.add_keys(pt=tf.gather_nd(temp_key_point.pt, p_id), size=tf.gather_nd(temp_key_point.size, p_id),
-                                 angle=orientation, octave=tf.gather_nd(temp_key_point.octave, p_id),
-                                 octave_id=tf.gather_nd(temp_key_point.octave_id, p_id),
-                                 response=tf.gather_nd(temp_key_point.response, p_id))
+        pack_keys, names = temp_key_point.pack_values()
+        pack_keys = tf.gather_nd(pack_keys, p_id)
+        unpack_keys = self.key_points.unpack_values(pack_keys)
+
+        add_keys = {}
+        for name, val in zip(names, unpack_keys):
+            if name == 'angle':
+                val = orientation
+            add_keys[name] = val
+
+        self.key_points.add_keys(**add_keys)
         return self.key_points
 
     def compute_default_N_octaves(
@@ -445,9 +692,9 @@ class SIFT:
 
     def __compute_histogram(
             self,
-            key_point: KeyPoint
+            key_point: KeyPointsSift.KeyPoint
     ) -> tf.Tensor:
-        octave = self.octave_pyramid[key_point.octave_id]
+        octave = self.octave_pyramid[int(key_point.octave_id)]
         scale = self.__scale_factor * key_point.size / (2 ** (tf.cast(key_point.octave_id, dtype=self.__DTYPE) + 1))
         radius = tf.cast(tf.round(self.__radius_factor * scale), dtype=tf.int32)
         weight_factor = -0.5 / (scale ** 2)
@@ -458,7 +705,7 @@ class SIFT:
 
         region_center = tf.cast(key_point.pt * _prob, dtype=tf.int64)
 
-        con = (radius * 2) + 3
+        con = int((radius * 2) + 3)
         block = make_neighborhood2D(region_center, con=con, origin_shape=octave.gaus_X.shape)
 
         if block.shape[0] == 0:
@@ -493,4 +740,9 @@ if __name__ == '__main__':
 
     alg = SIFT(sigma=1.6)
     alg.build_pyramid(img, num_octaves=4, num_intervals=5)
-    kp = alg.extract_keypoints()
+    # kp = alg.extract_keypoints()
+    # kp.remove_duplicate()
+    #
+    # K = kp.as_size_image()
+    # k1 = K[0]
+

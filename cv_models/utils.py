@@ -106,7 +106,7 @@ def make_neighborhood2D(
         origin_shape: Union[None, tuple, list, tf.TensorShape] = None
 ) -> tf.Tensor:
     B, ndim = init_cords.get_shape()
-
+    con = int(con)
     assert ndim == 4
 
     ax = tf.range(-con // 2 + 1, (con // 2) + 1, dtype=tf.int64)
