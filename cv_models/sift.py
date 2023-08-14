@@ -4,6 +4,7 @@ from cv_models.utils import PI, gaussian_kernel, compute_extrema3D, make_neighbo
     make_neighborhood2D, gaussian_blur, compute_central_gradient3D, compute_central_gradient2D, compute_hessian_3D
 from tensorflow.python.keras import backend
 import numpy as np
+from collections import namedtuple
 
 # from viz import show_images
 
@@ -34,7 +35,7 @@ class SIFT:
         self.__radius_factor = 3
         self.__con = 3
         self.epsilon = 1e-05
-        self.octave_pyramid = []
+        self.octave_pyramid = np.array([], dtype=object)
         self.X_base = None
         self.n_octaves = tf.cast(n_octaves, dtype=tf.int32)
         self.n_intervals = tf.cast(n_intervals, dtype=tf.int32)
@@ -42,6 +43,7 @@ class SIFT:
         self.sigma = tf.cast(sigma, dtype=self.__DTYPE)
         self.assume_blur_sigma = tf.cast(assume_blur_sigma, dtype=self.__DTYPE)
         self.key_points = self.KeyPointsSift()
+        self.descriptors_vectors = None
         self.border_width = (3, 3, 0)
 
     def __localize_extrema(self, middle_pixel_cords: tf.Tensor, dOg_array: tf.Tensor,
@@ -191,6 +193,83 @@ class SIFT:
         hist = tf.tensor_scatter_nd_add(hist, hist_index, tf.reshape(weight * magnitude, (-1,)))
         return hist
 
+    def __trilinear_interpolation(self, yxz: tf.Tensor, values: tf.Tensor) -> tuple:
+        _xyz_shape = yxz.get_shape()
+        _val_shape = values.get_shape()
+        if len(_xyz_shape) > 2: raise ValueError('expected xyz to be 2D tensor with shape of (None, 3)')
+        if len(_val_shape) > 1: raise ValueError('expected values to be 1D tensor with shape of (None, )')
+
+        yxz = tf.reshape(yxz, shape=(-1, 3))
+        values = tf.reshape(values, shape=(-1,))
+
+        _xyz_shape = yxz.get_shape()
+        _val_shape = values.get_shape()
+
+        if _xyz_shape[0] != _val_shape[0]: raise ValueError('xyz and values has different size')
+
+        yxz = tf.cast(yxz, dtype=values.dtype)
+
+        y, x, z = tf.unstack(yxz, num=3, axis=-1)
+
+        # interpolation in x direction
+        _C0 = values * (1 - x)
+        _C1 = values * x
+
+        # interpolation in y direction
+        _C00 = _C0 * (1 - y)
+        _C01 = _C0 * y
+
+        _C10 = _C1 * (1 - y)
+        _C11 = _C1 * y
+
+        # interpolation in z direction
+        _C000 = _C00 * (1 - z)
+        _C001 = _C00 * z
+        _C010 = _C01 * (1 - z)
+        _C011 = _C01 * z
+        _C100 = _C10 * (1 - z)
+        _C101 = _C10 * z
+        _C110 = _C11 * (1 - z)
+        _C111 = _C11 * z
+
+        points = namedtuple('points', 'C000, C001, C010, C011, C100, C101, C110, C111')
+        out = points(_C000, _C001, _C010, _C011, _C100, _C101, _C110, _C111)
+        return out
+
+    def __unpack_tri_to_histogram(self, yxz: tf.Tensor, points: tuple, window_width: int, n_bins: int = 8) -> tf.Tensor:
+        _xyz_shape = yxz.get_shape()
+
+        if len(_xyz_shape) > 2: raise ValueError('expected xyz to be 2D tensor with shape of (None, 3)')
+        yxz = tf.reshape(yxz, shape=(-1, 3))
+        y, x, z = tf.unstack(yxz, num=3, axis=-1)
+
+        _C000, _C001, _C010, _C011, _C100, _C101, _C110, _C111 = points
+        histogram = tf.zeros((window_width + 2, window_width + 2, n_bins), dtype=tf.float32)
+
+        _add_one = lambda c: c + 1
+        _add_two = lambda c: c + 2
+        _modulus = lambda c: (c + 1) % n_bins
+        _none = lambda c: c
+
+        z_pack = [_none, _modulus]
+        x_pack = [_add_one, _add_two]
+        y_pack = [_add_one, _add_two]
+
+        for i, _C in enumerate(points):
+            zi = z_pack[0](z)
+            z_pack[0], z_pack[1] = z_pack[1], z_pack[0]
+
+            if (i % 2) == 0: x_pack[0], x_pack[1] = x_pack[1], x_pack[0]
+            xi = x_pack[0](x)
+
+            if (i % 4) == 0: y_pack[0], y_pack[1] = y_pack[1], y_pack[0]
+            yi = y_pack[0](y)
+
+            cords = tf.stack((yi, xi, zi), axis=-1)
+
+            histogram = tf.tensor_scatter_nd_add(histogram, cords, _C)
+        return histogram
+
     def compute_default_N_octaves(self, image_shape: Union[tf.Tensor, list, tuple], min_shape: int = 0) -> tf.Tensor:
         assert len(image_shape) == 4
         b, h, w, d = tf.unstack(image_shape, num=4)
@@ -279,7 +358,7 @@ class SIFT:
                 gaussian_X = tf.concat(gaussian_X, axis=-1)
                 DOG_X = tf.concat(DOG_X, axis=-1)
 
-                self.octave_pyramid.append(self.Octave(oc_id, gaussian_X))
+                self.octave_pyramid = np.append(self.octave_pyramid, self.Octave(oc_id, gaussian_X))
 
                 continue_search = compute_extrema3D(
                     DOG_X, threshold=threshold, con=self.__con, border_width=border_width, epsilon=self.epsilon
@@ -385,15 +464,110 @@ class SIFT:
         self.key_points.remove_duplicate()
         return self.key_points
 
+    def generate_descriptors(self):
+        num_bins = 8
+        bins_per_degree = num_bins / 360.
+        window_width = 4
+        weight_multiplier = -0.5 / ((0.5 * window_width) ** 2)
+        scale_multiplier = 3
+        key_points = self.key_points.key_points
+
+        _cap = [[[]] * self.octave_pyramid[0].shape[-1]] * len(self.octave_pyramid)
+
+        for k in range(len(key_points)):
+            curr_kp = key_points[k]
+
+            octave, layer, scale = tf.unstack(curr_kp.unpacked_octave, 3, axis=1)
+            oc_id = tf.cast(octave + 1, dtype=tf.int32)
+            layer = tf.cast(layer, dtype=tf.int32)
+
+            scale_pad = tf.pad(tf.repeat(scale, 2, axis=0), paddings=tf.constant([[1, 0]]), constant_values=1.0)
+            scale_pad = tf.pad(scale_pad, paddings=tf.constant([[0, 1]]), constant_values=0.0)
+
+            point = tf.cast(tf.round(curr_kp.pt * scale_pad), dtype=tf.int64)
+            angle = 360. - curr_kp.angle
+            cos_angle = math.cos((PI / 180) * angle)
+            sin_angle = math.sin((PI / 180) * angle)
+            hist_width = scale_multiplier * 0.5 * tf.reshape(scale, (-1,)) * curr_kp.size
+            hist_width = tf.cast(
+                tf.round(hist_width * math.sqrt(2.0) * (window_width + 1.0) * 0.5), dtype=tf.int32
+            )
+
+            if _cap[oc_id][layer]:
+                gaussian_image, magnitude, orientation = _cap[oc_id][layer]
+            else:
+                gaussian_image = self.octave_pyramid[oc_id].gradient
+                _n = gaussian_image.get_shape()[-1]
+                _, gaussian_image, _ = tf.split(gaussian_image, [layer, 1, _n - 1 - layer], axis=-1)
+
+                magnitude, orientation = self.octave_pyramid[oc_id].magnitude_orientation
+                _, magnitude, _ = tf.split(magnitude, [layer, 1, _n - 1 - layer], axis=-1)
+                _, orientation, _ = tf.split(orientation, [layer, 1, _n - 1 - layer], axis=-1)
+
+                _cap[oc_id][layer].append((gaussian_image, magnitude, orientation))
+
+            hist_width = math.minimum(hist_width, tf.reduce_max(tf.shape(gaussian_image)))
+            cords = make_neighborhood2D(point, con=int(hist_width * 2), origin_shape=gaussian_image.get_shape())
+            if cords.shape[0] is None:
+                continue
+
+            gaus_img = tf.gather_nd(gaussian_image, tf.reshape(cords, shape=(-1, 4)))
+            gaus_img = tf.reshape(gaus_img, shape=(1, int(hist_width * 2), int(hist_width * 2), 1))
+
+            # mag_curr + orien
+
+            hist_width = tf.cast(hist_width, dtype=tf.float32)
+
+            block_ = make_neighborhood2D(tf.constant([[0, 0, 0, 0]], dtype=tf.int64), con=int((hist_width - 1) * 2))
+            block_ = tf.cast(block_, dtype=tf.float32)
+            block_ = tf.reshape(block_, (-1, 4))
+            _, _y, _x, _ = tf.unstack(block_, 4, axis=-1)
+
+            _Z = (orientation - angle) * bins_per_degree
+
+            _yr = _x * sin_angle + _y * cos_angle
+            _xr = _x * cos_angle - _y * sin_angle
+            _Y = (_yr / hist_width) + 0.5 * 4 - 0.5
+            _X = (_xr / hist_width) + 0.5 * 4 - 0.5
+
+            weight = math.exp(weight_multiplier * ((_yr / hist_width) ** 2 + (_xr / hist_width) ** 2))
+            values = magnitude * weight
+
+            yxz = [_Y, _X, _Z]
+            yxz_floor = [math.floor(c) for c in yxz]
+
+            yxz_frac = [c1 - math.floor(c2) for c1, c2 in zip(yxz, yxz_floor)]
+
+            orientation_bin_floor = math.floor(orientation)
+            orientation_bin_floor_plus = orientation_bin_floor + 8
+            orientation_bin_floor = tf.where(
+                math.logical_and(orientation_bin_floor < 0, orientation_bin_floor_plus < 8), orientation_bin_floor_plus,
+                orientation_bin_floor)
+
+
+        return
+
     class Octave:
         def __init__(self, octave_id: int, x_gaussian: tf.Tensor):
             self.octave_id = octave_id
             self.x_gaussian = x_gaussian
             self.__shape = tf.TensorShape(tf.shape(x_gaussian))
+            self.__gradient = compute_central_gradient2D(self.x_gaussian) * 0.5
 
         @property
         def shape(self):
             return self.__shape
+
+        @property
+        def gradient(self):
+            return self.__gradient
+
+        @property
+        def magnitude_orientation(self):
+            dx, dy = tf.unstack(self.__gradient, 2, axis=-1)
+            mag = math.sqrt(dx * dx + dy * dy)
+            ori = (math.atan2(dx, dy) * (180.0 / PI)) % 360
+            return mag, ori
 
     class KeyPointsSift:
         __DTYPE = backend.floatx()
@@ -451,6 +625,25 @@ class SIFT:
                 )
                 self.__key_points = np.append(self.__key_points, key)
             return self.__key_points
+
+        @property
+        def unpacked_octave(self):
+            if self.octave is None:
+                return None
+            if not self.size_image:
+                return self.as_size_image().unpacked_octave
+            octave = bitwise_ops.bitwise_and(self.octave, 255)
+            layer = bitwise_ops.right_shift(self.octave, 8)
+            layer = bitwise_ops.bitwise_and(layer, 255)
+
+            octave = tf.where(octave >= 128, bitwise_ops.bitwise_or(octave, -128), octave)
+
+            scale = tf.where(
+                octave >= 1,
+                tf.cast(1 / tf.bitwise.left_shift(1, octave), dtype=tf.float32),
+                tf.cast(tf.bitwise.left_shift(1, -octave), dtype=tf.float32)
+            )
+            return tf.cast(octave, dtype=tf.float32), tf.cast(layer, dtype=tf.float32), scale
 
         def __concat_with_backend(self, values):
             backend_values = self.__backend
@@ -626,9 +819,10 @@ class SIFT:
             @property
             def unpacked_octave(self):
                 if not self.size_image:
-                    return None
+                    return self.as_size_image().unpacked_octave
                 octave = bitwise_ops.bitwise_and(self.octave, 255)
-                layer = bitwise_ops.right_shift(self.octave, 8) & 255
+                layer = bitwise_ops.right_shift(self.octave, 8)
+                layer = bitwise_ops.bitwise_and(layer, 255)
                 if octave >= 128: octave = bitwise_ops.bitwise_or(octave, -128)
                 scale = 1 / tf.bitwise.left_shift(1, octave) if octave >= 1 else tf.bitwise.left_shift(1, -octave)
                 return tf.concat([tf.cast(a[..., tf.newaxis], dtype=tf.float32) for a in [octave, layer, scale]],
@@ -641,86 +835,6 @@ class SIFT:
                 size = self.size * 0.5
                 octave = (self.octave & ~255) | ((self.octave - 1) & 255)
                 return type(self)(pt, size, self.angle, octave, self.octave_id, self.response)
-
-            def descriptors(self, gaussian_image: tf.Tensor, num_bins: int = 8, window_width: float = 4.0,
-                            scale_multiplier: float = 3):
-                # if not self.size_image:
-                #     return None
-                # _shape = tf.shape(gaussian_image)
-                # up_octave = self.unpacked_octave
-                # octave, layer, scale = tf.split(up_octave, [1, 1, 1], axis=1)
-                # scale_pad = tf.pad(tf.repeat(scale, 2, axis=0), paddings=tf.constant([[0, 0], [1, 1]]), constant_values=1.0)
-                # point = tf.cast(tf.round(self.pt * scale), dtype=tf.int64)
-                # bins_per_degree = num_bins / 360.
-                # angle = 360. - self.angle
-                # cos_angle = math.cos((PI / 180) * angle)
-                # sin_angle = math.sin((PI / 180) * angle)
-                # weight_multiplier = -0.5 / ((0.5 * window_width) ** 2)
-                #
-                # hist_width = scale_multiplier * 0.5 * tf.reshape(scale, (-1,)) * self.size
-                #
-                # hist_width = tf.cast(
-                #     tf.round(
-                #         hist_width * math.sqrt(2.0) * (window_width + 1.0) * 0.5
-                #     ), dtype=tf.int32
-                # )
-                #
-                # hist_width = math.minimum(hist_width, tf.reduce_max(_shape))
-                # oc = alg.octave_pyramid[0]
-                #
-                # point, cos_angle, sin_angle, weight_multiplier, hist_width = k1.descriptors(oc.gaus_X)
-                #
-                # cords = make_neighborhood2D(point, con=int(hist_width * 2), origin_shape=oc.gaus_X.shape)
-                #
-                # gaus_img = tf.gather_nd(oc.gaus_X, tf.reshape(cords, shape=(-1, 4)))
-                # gaus_img = tf.reshape(gaus_img, shape=(1, int(hist_width * 2), int(hist_width * 2), 1))
-                #
-                # gaus_grad = compute_central_gradient2D(gaus_img)
-                #
-                # dx, dy = tf.split(gaus_grad, [1, 1], axis=-1)
-                # magnitude = tf.reshape(math.sqrt(dx * dx + dy * dy), (-1,))
-                # orientation = tf.reshape((math.atan2(dx, dy) * (180.0 / PI)) % 360, (-1,))
-                #
-                # block_ = make_neighborhood2D(tf.constant([[0, 0, 0, 0]], dtype=tf.int64), con=int((hist_width - 1) * 2))
-                # block_ = tf.cast(block_, dtype=tf.float32)
-                # block_ = tf.reshape(block_, (-1, 4))
-                # _, y, x, _ = tf.split(block_, [1, 1, 1, 1], axis=-1)
-                #
-                # y_rot = x * sin_angle + y * cos_angle
-                # x_rot = x * cos_angle - y * sin_angle
-                # y_bin = (y_rot / hist_width) + 0.5 * 4 - 0.5
-                # x_bin = (x_rot / hist_width) + 0.5 * 4 - 0.5
-                #
-                # hist_width = tf.cast(hist_width, dtype=tf.float32)
-                #
-                # weight = math.exp(weight_multiplier * ((y_rot / hist_width) ** 2 + (x_rot / hist_width) ** 2))
-                #
-                # orientation_frac_ = orientation - math.floor(orientation)
-                # orientation_frac_ = tf.reshape(orientation_frac_, (-1,))
-                # y_bin_frac_ = y_bin - math.floor(y_bin)
-                # x_bin_frac_ = x_bin - math.floor(x_bin)
-                #
-                # orientation_bin_floor = math.floor(orientation)
-                # orientation_bin_floor_plus = orientation_bin_floor + 8
-                # orientation_bin_floor = tf.where(
-                #     math.logical_and(orientation_bin_floor < 0, orientation_bin_floor_plus < 8), orientation_bin_floor_plus,
-                #     orientation_bin_floor)
-                #
-                # c1 = magnitude * y_bin_frac_
-                # c0 = magnitude * (1 - y_bin_frac_)
-                # c11 = c1 * x_bin_frac_
-                # c10 = c1 * (1 - x_bin_frac_)
-                # c01 = c0 * x_bin_frac_
-                # c00 = c0 * (1 - x_bin_frac_)
-                # c111 = c11 * orientation_frac_
-                # c110 = c11 * (1 - orientation_frac_)
-                # c101 = c10 * orientation_frac_
-                # c100 = c10 * (1 - orientation_frac_)
-                # c011 = c01 * orientation_frac_
-                # c010 = c01 * (1 - orientation_frac_)
-                # c001 = c00 * orientation_frac_
-                # c000 = c00 * (1 - orientation_frac_)
-                return
 
 
 def show_key_points(key_points, image):
@@ -738,7 +852,7 @@ def show_key_points(key_points, image):
     img_mark = image * marked_del
 
     marked = tf.concat((marked, tf.zeros_like(image), tf.zeros_like(image)), axis=-1)
-    
+
     img_mark = img_mark + marked
     show_images(img_mark, 1, 1)
 
@@ -751,4 +865,202 @@ if __name__ == '__main__':
     alg = SIFT(sigma=1.6, n_octaves=4, n_intervals=5)
     kp = alg.build_graph(img)
 
-    show_key_points(kp, img)
+    assert isinstance(kp, SIFT.KeyPointsSift)
+    # show_key_points(kp, img)
+
+    # kp = kp.as_size_image()
+    #
+    # num_bins = 8
+    # bins_per_degree = num_bins / 360.
+    # window_width = 4
+    # weight_multiplier = -0.5 / ((0.5 * window_width) ** 2)
+    # scale_multiplier = 3
+    #
+    # _octave, _layer, _scale = kp.unpacked_octave
+    # _oc_id = tf.cast(_octave, dtype=tf.int32)
+    # _layer = tf.cast(_layer, dtype=tf.int32)
+    # _scale_pad = tf.pad(tf.repeat(tf.expand_dims(_scale, 1), 2, axis=1), paddings=tf.constant([[0, 0], [1, 0]]),
+    #                     constant_values=1.0)
+    # _scale_pad = tf.pad(_scale_pad, paddings=tf.constant([[0, 0], [0, 1]]), constant_values=0.0)
+    #
+    # _point = tf.cast(tf.round(kp.pt * _scale_pad), dtype=tf.int64)
+    #
+    # _angle = 360. - kp.angle
+    # _cos_angle = math.cos((PI / 180) * _angle)
+    # _sin_angle = math.sin((PI / 180) * _angle)
+    #
+    # _hist_width = scale_multiplier * 0.5 * _scale * kp.size
+    #
+    # _hist_width = tf.cast(tf.round(_hist_width * math.sqrt(2.0) * (window_width + 1.0) * 0.5), dtype=tf.int32)
+    #
+    # _hist_width = tf.minimum(_hist_width, tf.reduce_max(tf.shape(alg.octave_pyramid[0].x_gaussian)[1:-1]))
+    # _cords = make_neighborhood2D(tf.constant([[0, 0, 0, 0]], dtype=tf.int64),
+    #                              con=int((tf.reduce_max(_hist_width) - 1) * 2))
+
+    # m_o = alg.octave_pyramid[0].magnitude_orientation
+
+    # k1 = kp_up[0]
+    #
+    # up_octave = k1.unpacked_octave
+    # octave, layer, scale = tf.unstack(up_octave, 3, axis=1)
+    # oc_id = int(octave + 1)
+    # layer = int(layer)
+    # gaussian_image = alg.octave_pyramid[oc_id].x_gaussian
+    # d_ = gaussian_image.get_shape()[-1]
+    #
+    # _, gaussian_image, _ = tf.split(gaussian_image, [layer, 1, d_ - 1 - layer], axis=-1)
+    # scale_pad = tf.pad(tf.repeat(scale, 2, axis=0), paddings=tf.constant([[1, 0]]), constant_values=1.0)
+    # scale_pad = tf.pad(scale_pad, paddings=tf.constant([[0, 1]]), constant_values=0.0)
+    #
+    # point = tf.cast(tf.round(k1.pt * scale_pad), dtype=tf.int64)
+    # num_bins = 8
+    # bins_per_degree = num_bins / 360.
+    #
+    # window_width = 4
+    # angle = 360. - k1.angle
+    # cos_angle = math.cos((PI / 180) * angle)
+    # sin_angle = math.sin((PI / 180) * angle)
+    # weight_multiplier = -0.5 / ((0.5 * window_width) ** 2)
+    #
+    # scale_multiplier = 3
+    # hist_width = scale_multiplier * 0.5 * tf.reshape(scale, (-1,)) * k1.size
+    #
+    # hist_width = tf.cast(
+    #     tf.round(
+    #         hist_width * math.sqrt(2.0) * (window_width + 1.0) * 0.5
+    #     ), dtype=tf.int32
+    # )
+    #
+    # hist_width = math.minimum(hist_width, tf.reduce_max(tf.shape(gaussian_image)))
+    # cords = make_neighborhood2D(point, con=int(hist_width * 2), origin_shape=gaussian_image.get_shape())
+    #
+    # gaus_img = tf.gather_nd(gaussian_image, tf.reshape(cords, shape=(-1, 4)))
+    # gaus_img = tf.reshape(gaus_img, shape=(1, int(hist_width * 2), int(hist_width * 2), 1))
+    #
+    # gaus_grad = compute_central_gradient2D(gaus_img)
+    #
+    # dx, dy = tf.split(gaus_grad, [1, 1], axis=-1)
+    # magnitude = tf.reshape(math.sqrt(dx * dx + dy * dy), (-1,))
+    # orientation = tf.reshape((math.atan2(dx, dy) * (180.0 / PI)) % 360, (-1,))
+    #
+    # orientation = (orientation - angle) * bins_per_degree
+    #
+    # block_ = make_neighborhood2D(tf.constant([[0, 0, 0, 0]], dtype=tf.int64), con=int((hist_width - 1) * 2))
+    # block_ = tf.cast(block_, dtype=tf.float32)
+    # block_ = tf.reshape(block_, (-1, 4))
+    # _, y, x, _ = tf.unstack(block_, 4, axis=-1)
+    #
+    # hist_width = tf.cast(hist_width, dtype=tf.float32)
+    #
+    # y_rot = x * sin_angle + y * cos_angle
+    # x_rot = x * cos_angle - y * sin_angle
+    # y_bin = (y_rot / hist_width) + 0.5 * 4 - 0.5
+    # x_bin = (x_rot / hist_width) + 0.5 * 4 - 0.5
+    #
+    # weight = math.exp(weight_multiplier * ((y_rot / hist_width) ** 2 + (x_rot / hist_width) ** 2))
+    # magnitude = magnitude * weight
+    #
+    # orientation_frac_ = orientation - math.floor(orientation)
+    # orientation_frac_ = tf.reshape(orientation_frac_, (-1,))
+    # y_bin_frac_ = y_bin - math.floor(y_bin)
+    # x_bin_frac_ = x_bin - math.floor(x_bin)
+    #
+    # orientation_bin_floor = math.floor(orientation)
+    # orientation_bin_floor_plus = orientation_bin_floor + 8
+    # orientation_bin_floor = tf.where(
+    #     math.logical_and(orientation_bin_floor < 0, orientation_bin_floor_plus < 8), orientation_bin_floor_plus,
+    #     orientation_bin_floor)
+    #
+    # c1 = magnitude * y_bin_frac_
+    # c0 = magnitude * (1 - y_bin_frac_)
+    # c11 = c1 * x_bin_frac_
+    # c10 = c1 * (1 - x_bin_frac_)
+    # c01 = c0 * x_bin_frac_
+    # c00 = c0 * (1 - x_bin_frac_)
+    # c111 = c11 * orientation_frac_
+    # c110 = c11 * (1 - orientation_frac_)
+    # c101 = c10 * orientation_frac_
+    # c100 = c10 * (1 - orientation_frac_)
+    # c011 = c01 * orientation_frac_
+    # c010 = c01 * (1 - orientation_frac_)
+    # c001 = c00 * orientation_frac_
+    # c000 = c00 * (1 - orientation_frac_)
+    #
+    # histogram = tf.zeros((window_width + 2, window_width + 2, num_bins), dtype=tf.float32)
+    #
+    # even_row = math.floor(y_bin) + 1
+    # even_col = math.floor(x_bin) + 1
+    # even_or = orientation_bin_floor
+    #
+    # even_cords = tf.stack((even_row, even_col, even_or), axis=-1)
+    # even_cords = tf.cast(even_cords, dtype=tf.int64)
+    #
+    # histogram = tf.tensor_scatter_nd_add(histogram, even_cords, c000)
+    #
+    #
+    # even_or = (orientation_bin_floor + 1) % num_bins
+    #
+    # even_cords = tf.stack((even_row, even_col, even_or), axis=-1)
+    # even_cords = tf.cast(even_cords, dtype=tf.int64)
+    #
+    # histogram = tf.tensor_scatter_nd_add(histogram, even_cords, c001)
+    #
+    # even_row = math.floor(y_bin) + 1
+    # even_col = math.floor(x_bin) + 2
+    # even_or = orientation_bin_floor
+    #
+    # even_cords = tf.stack((even_row, even_col, even_or), axis=-1)
+    # even_cords = tf.cast(even_cords, dtype=tf.int64)
+    #
+    # histogram = tf.tensor_scatter_nd_add(histogram, even_cords, c010)
+    #
+    # even_or = (orientation_bin_floor + 1) % num_bins
+    # even_cords = tf.stack((even_row, even_col, even_or), axis=-1)
+    # even_cords = tf.cast(even_cords, dtype=tf.int64)
+    #
+    # histogram = tf.tensor_scatter_nd_add(histogram, even_cords, c011)
+    #
+    # even_row = math.floor(y_bin) + 2
+    # even_col = math.floor(x_bin) + 1
+    # even_or = orientation_bin_floor
+    #
+    # even_cords = tf.stack((even_row, even_col, even_or), axis=-1)
+    # even_cords = tf.cast(even_cords, dtype=tf.int64)
+    #
+    # histogram = tf.tensor_scatter_nd_add(histogram, even_cords, c100)
+    #
+    # even_or = (orientation_bin_floor + 1) % num_bins
+    # even_cords = tf.stack((even_row, even_col, even_or), axis=-1)
+    # even_cords = tf.cast(even_cords, dtype=tf.int64)
+    #
+    # histogram = tf.tensor_scatter_nd_add(histogram, even_cords, c101)
+    #
+    # even_row = math.floor(y_bin) + 2
+    # even_col = math.floor(x_bin) + 2
+    # even_or = orientation_bin_floor
+    #
+    # even_cords = tf.stack((even_row, even_col, even_or), axis=-1)
+    # even_cords = tf.cast(even_cords, dtype=tf.int64)
+    #
+    # histogram = tf.tensor_scatter_nd_add(histogram, even_cords, c110)
+    #
+    # even_or = (orientation_bin_floor + 1) % num_bins
+    # even_cords = tf.stack((even_row, even_col, even_or), axis=-1)
+    # even_cords = tf.cast(even_cords, dtype=tf.int64)
+    #
+    # histogram = tf.tensor_scatter_nd_add(histogram, even_cords, c111)
+    #
+    # descriptor_max_value = 0.2
+    # descriptor_vector = tf.slice(histogram, [1, 1, 0], [4, 4, 8])
+    # descriptor_vector = tf.reshape(descriptor_vector, (-1, ))
+    #
+    # threshold = tf.norm(descriptor_vector) * descriptor_max_value
+    #
+    # descriptor_vector = tf.where(descriptor_vector > threshold, threshold, descriptor_vector)
+    #
+    # descriptor_vector = descriptor_vector / tf.maximum(tf.norm(descriptor_vector), 1e-5)
+    #
+    # descriptor_vector = tf.round(descriptor_vector * 512)
+    #
+    # descriptor_vector = tf.maximum(descriptor_vector, 0)
+    # descriptor_vector = tf.minimum(descriptor_vector, 255)
