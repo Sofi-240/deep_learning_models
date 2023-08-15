@@ -5,8 +5,10 @@ from cv_models.utils import PI, gaussian_kernel, compute_extrema3D, make_neighbo
 from tensorflow.python.keras import backend
 import numpy as np
 from collections import namedtuple
-# from viz import show_images
+from scipy import spatial
+from tensorflow.python.ops import array_ops
 
+# from viz import show_images
 
 math = tf.math
 linalg = tf.linalg
@@ -355,7 +357,7 @@ class SIFT:
         self.epsilon = 1e-05
         self.octave_pyramid = np.array([], dtype=object)
         self.X_base = None
-        self.n_octaves = tf.cast(n_octaves, dtype=tf.int32)
+        self.n_octaves = None if n_octaves is None else tf.cast(n_octaves, dtype=tf.int32)
         self.n_intervals = tf.cast(n_intervals, dtype=tf.int32)
         self.n_iterations = tf.cast(n_iterations, dtype=tf.int32)
         self.sigma = tf.cast(sigma, dtype=self.__DTYPE)
@@ -369,7 +371,6 @@ class SIFT:
                            octave_index: Union[int, float]) -> tuple[
         Union[tf.Tensor, None], Union[UtilsSift.KeyPointsSift, None]]:
         dog_shape_ = dOg_array.shape
-
         cube_neighbor = make_neighborhood3D(middle_pixel_cords, con=self.__con, origin_shape=dog_shape_)
         if cube_neighbor.shape[0] == 0:
             return None, None
@@ -453,7 +454,6 @@ class SIFT:
         shape_ = extrema.get_shape()
         assert shape_[-1] == 3
         assert len(shape_) == 2
-
         cond = math.less(math.reduce_max(math.abs(extrema), axis=-1), self.__extrema_offset)
 
         next_step_cords_temp = tf.boolean_mask(current_cords, ~cond)
@@ -592,7 +592,6 @@ class SIFT:
 
     def __descriptor_vector(self, key_point: UtilsSift.KeyPoint, num_bins: int = 8, window_width: int = 4,
                             scale_multiplier: int = 3, descriptor_max_value: float = 0.2):
-
         bins_per_degree = num_bins / 360.
         weight_multiplier = -0.5 / ((0.5 * window_width) ** 2)
 
@@ -697,7 +696,7 @@ class SIFT:
         return tf.cast(n_octaves, tf.int32)
 
     def build_graph(self, inputs: tf.Tensor) -> tuple[UtilsSift.KeyPointsSift, Union[None, tf.Tensor]]:
-        _shape = tf.shape(inputs)
+        _shape = inputs.shape
         _n_dims = len(_shape)
         if _n_dims != 4 or _shape[-1] != 1:
             raise ValueError(
@@ -724,6 +723,7 @@ class SIFT:
 
         sigma_prev = (K ** (tf.cast(tf.range(1, images_per_octaves), dtype=self.__DTYPE) - 1.0)) * self.sigma
         sigmas = math.sqrt((K * sigma_prev) ** 2 - sigma_prev ** 2)
+        sigmas = math.maximum(sigmas, 0.8)
 
         gaussian_kernels = [
             gaussian_kernel(kernel_size=0, sigma=s) for s in sigmas
@@ -756,7 +756,7 @@ class SIFT:
         n_iterations = int(self.n_iterations)
         threshold = tf.floor(0.5 * self.__contrast_threshold / 3.0 * 255.0)
         border_width = self.border_width
-
+        print('build_pyramid')
         for i in tf.range(self.n_octaves * _N_per_oc):
             kernel = gaussian_kernels[(i % _N_per_oc)]
             prev_x = gaussian_X[-1]
@@ -807,7 +807,7 @@ class SIFT:
 
         histogram = []
         del_points = []
-
+        print('build_histogram')
         for k in range(len(temp_key_point)):
             curr_kp = temp_key_point[k]
             curr_hist = self.__compute_histogram(curr_kp)
@@ -871,6 +871,7 @@ class SIFT:
             if name == 'angle': val = orientation
             add_keys[name] = val
 
+        print('build_descriptors')
         self.key_points.add_keys(**add_keys)
         if not self.with_descriptors:
             self.key_points.remove_duplicate()
@@ -944,23 +945,38 @@ def show_key_points(key_points, image):
     show_images(img_mark, 1, 1)
 
 
-
 if __name__ == '__main__':
     img1 = tf.keras.utils.load_img('box.png', color_mode='grayscale')
     img1 = tf.convert_to_tensor(tf.keras.utils.img_to_array(img1), dtype=tf.float32)
     img1 = img1[tf.newaxis, ...]
 
-    alg1 = SIFT(sigma=1.6, n_octaves=4, n_intervals=5, with_descriptors=True)
-    kp1, desc1 = alg1.build_graph(img1)
+    alg = SIFT(sigma=1.4, n_octaves=4, n_intervals=4, with_descriptors=True)
+    kp1, desc1 = alg.build_graph(img1)
+    # show_key_points(kp1, img1)
 
-    img2 = tf.keras.utils.load_img('box_in_scene.png', color_mode='grayscale')
-    img2 = tf.convert_to_tensor(tf.keras.utils.img_to_array(img2), dtype=tf.float32)
-    img2 = img2[tf.newaxis, ...]
+    # oc = alg,octave_pyramid[0][0]
 
-    alg2 = SIFT(sigma=1.6, n_octaves=4, n_intervals=5, with_descriptors=True)
-    kp2, desc2 = alg2.build_graph(img2)
+    # img2 = tf.keras.utils.load_img('box_in_scene.png', color_mode='grayscale')
+    # img2 = tf.convert_to_tensor(tf.keras.utils.img_to_array(img2), dtype=tf.float32)
+    # img2 = img2[tf.newaxis, ...]
+    #
+    # tf.summary.trace_off()
+    #
+    # kp2, desc2 = SIFT(sigma=1.4, n_octaves=4, n_intervals=4, with_descriptors=True).build_graph(img2)
+    # show_key_points(kp2, img2)
 
-
-
-
-
+    # tree = spatial.KDTree(desc1)
+    #
+    # dd, ii = tree.query(desc2, k=2, p=2)
+    #
+    # m, n = tf.unstack(dd, 2, -1)
+    #
+    # match = math.greater_equal(m, n * 0.7)
+    #
+    # query_index = tf.boolean_mask(tf.range(ii.shape[0]), match)
+    #
+    # tmpl_index = tf.boolean_mask(tf.unstack(ii, 2, -1)[0], match)
+    #
+    # query_cords = tf.cast(tf.gather(kp2.pt, query_index), dtype=tf.int64) * tf.constant([1, 1, 1, 0], dtype=tf.int64)
+    #
+    # tmpl_cords = tf.cast(tf.gather(kp1.pt, tmpl_index), dtype=tf.int64) * tf.constant([1, 1, 1, 0], dtype=tf.int64)
