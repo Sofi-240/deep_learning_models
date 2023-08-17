@@ -195,22 +195,18 @@ def compute_extrema3D(
 
     half_con = [c // 2 for c in con]
 
-    X_pad = X[..., tf.newaxis]
-    X_pad = tf.transpose(X_pad, perm=(0, 3, 1, 2, 4))
+    x_con = tf.concat((X, X * -1.0), axis=-1)
 
-    extrema_max = tf.nn.max_pool3d(
-        X_pad, con, (1, 1, 1), 'VALID', data_format='NDHWC'
-    )
-    extrema_min = tf.nn.max_pool3d(
-        X_pad * -1.0, con, (1, 1, 1), 'VALID', data_format='NDHWC'
-    ) * -1.0
+    ex = tf.nn.max_pool2d(x_con, ksize=(3, 3), strides=[1, 1], padding='VALID')
+    ex = tf.transpose(ex, perm=(0, 1, 3, 2))
+    ex = tf.nn.max_pool2d(ex, ksize=(1, 3), strides=[1, 1], padding='VALID')
+    ex = tf.transpose(ex, perm=(0, 1, 3, 2))
 
-    extrema_max = tf.squeeze(tf.transpose(extrema_max, perm=(0, 2, 3, 1, 4)), axis=-1)
-    extrema_min = tf.squeeze(tf.transpose(extrema_min, perm=(0, 2, 3, 1, 4)), axis=-1)
+    e_ = int((d * 2) - 2)
+    extrema_max, _, extrema_min = tf.split(ex, [(e_ // 2) - 1, 2, (e_ // 2) - 1], axis=-1)
+    extrema_min = extrema_min * -1.0
 
-    _, compare_array, _ = tf.split(X, [half_con[-1], d - 2 * half_con[-1], half_con[-1]], axis=-1)
-    _, compare_array, _ = tf.split(compare_array, [half_con[1], w - 2 * half_con[1], half_con[1]], axis=2)
-    _, compare_array, _ = tf.split(compare_array, [half_con[0], h - 2 * half_con[0], half_con[0]], axis=1)
+    compare_array = tf.slice(X, [0, *half_con], [b, h - 2 * half_con[0], w - 2 * half_con[1], d - 2 * half_con[2]])
 
     def _equal_with_epsilon(arr):
         return tf.logical_and(
@@ -434,4 +430,3 @@ if __name__ == '__main__':
     g_xyz = tf.reduce_mean(tf.reshape(g_xyz, shape=(-1, 3)), axis=0)
 
     g_xy = compute_central_gradient2D(case2)
-
