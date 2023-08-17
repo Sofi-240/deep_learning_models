@@ -362,7 +362,7 @@ class SIFT:
                     maximum_iterations=n_iterations
                 )
                 key_points = params[-1]
-            gradient = unpack_rnn(gradient, 5)
+            gradient = unpack_rnn(gradient, 5) * 0.5
             dx, dy = tf.unstack(gradient, 2, axis=3)
             magnitude = math_ops.sqrt(dx * dx + dy * dy)
             orientation = math_ops.atan2(dx, dy) * (180.0 / PI)
@@ -563,9 +563,15 @@ class SIFT:
         return histogram
 
     def write_descriptors(self, key_points: tuple, octaves: list) -> tf.Tensor:
+        def recompute(oc):
+            dx = oc.dx * 2
+            dy = oc.dy * 2
+            magnitude = math_ops.sqrt(dx * dx + dy * dy)
+            orientation = (math_ops.atan2(dx, dy) * (180.0 / PI)) % 360
+            return self.__octaves_pack(oc.gaussian, dx, dy, magnitude, orientation)
         args = self.descriptors_args
         key_points = self.__key_points_pack(*key_points)
-        octaves = [self.__octaves_pack(*oc) for oc in octaves]
+        octaves = [recompute(oc) for oc in octaves]
 
         unpack_kp, unpack_oct = self.keys_to_image_size(key_points, unpack_octave=True)
 
@@ -619,7 +625,7 @@ class SIFT:
             i_cords = i_block + tf.expand_dims(i_point, axis=1)
 
             i_magnitude = tf.gather_nd(i_octave.magnitude, tf.reshape(i_cords, (-1, 4)))
-            i_orientation = tf.gather_nd(i_octave.orientation % 360., tf.reshape(i_cords, (-1, 4)))
+            i_orientation = tf.gather_nd(i_octave.orientation, tf.reshape(i_cords, (-1, 4)))
             i_angle = tf.gather(angle, i_job.idx)
 
             i_cos = tf.gather(cos_sin_angle.cos, i_job.idx)
