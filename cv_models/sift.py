@@ -1,17 +1,16 @@
 from typing import Union
 import tensorflow as tf
 from cv_models.utils import PI, gaussian_kernel, compute_extrema3D, make_neighborhood3D, \
-    make_neighborhood2D, gaussian_blur, compute_central_gradient3D, compute_hessian_3D
+    make_neighborhood2D, compute_central_gradient3D, compute_hessian_3D
 from tensorflow.python.keras import backend
-from tensorflow import keras
-from keras.layers import RNN
 from collections import namedtuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 
 backend.set_floatx('float32')
 linalg_ops = tf.linalg
 math_ops = tf.math
 bitwise_ops = tf.bitwise
+image_ops = tf.image
 
 
 @dataclass(eq=False, order=False)
@@ -67,6 +66,10 @@ class KeyPoints:
         unpacked_octave = unpacked_octave(tf.cast(octave, dtype=tf.float32), tf.cast(layer, dtype=tf.float32), scale)
         return unpack_key_points, unpacked_octave
 
+    def stack(self):
+        _stack = tf.concat(([self.pt, self.size, self.angle, self.octave, self.octave_id, self.response]), axis=-1)
+        return _stack
+
 
 @dataclass(eq=False, order=False, frozen=True)
 class Octave:
@@ -90,85 +93,54 @@ class Octave:
         return self.gaussian.shape.as_list()
 
 
-@dataclass(init=False, eq=False, order=False, frozen=True)
+@dataclass(eq=False, order=False)
 class Argumentor:
-    orientation_N_bins: int = 36
-    eigen_ration: int = 10
-    peak_ratio: float = 0.8
-    contrast_threshold: float = 0.04
-    scale_factor: float = 1.5
-    extrema_offset: float = 0.5
-    radius_factor: int = 3
-    con: int = 3
+    sigma: float = 1.4
+    assume_blur_sigma: float = 0.5
+    n_intervals: int = 4
+    n_iterations: int = 5
+    n_octaves: int = 4
     border_width: tuple = (3, 3, 0)
-    descriptors_N_bins: int = 8
-    window_width: int = 4
-    scale_multiplier: int = 3
-    descriptor_max_value: float = 0.2
-
-
-class OctaveRNN(keras.layers.Layer):
-    def __init__(self, shape, gaussian_kernels, name=None):
-        super(OctaveRNN, self).__init__(name=name or 'OctaveRNN')
-        b_, h_, w_, d_ = shape
-        self.state_size = tf.TensorShape([*shape])
-        self.output_size = [tf.TensorShape([*shape]), tf.TensorShape([*shape]),
-                            tf.TensorShape([b_, h_ - 2, w_ - 2, d_, 2])]
-        self.gaussian_kernels = [
-            tf.Variable(kernel, name=f'kernel{i}', trainable=False) for i, kernel in
-            enumerate(gaussian_kernels)
-        ]
-        kx = tf.constant([[0.0, 0.0, 0.0], [-1.0, 0.0, 1.0], [0.0, 0.0, 0.0]], dtype=tf.float32)
-        kx = tf.reshape(kx, shape=(3, 3, 1, 1))
-        ky = tf.constant([[0.0, -1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=tf.float32)
-        ky = tf.reshape(ky, shape=(3, 3, 1, 1))
-        self.kernels_grad = tf.Variable(tf.concat((kx, ky), axis=-1), name='kernels_grad', trainable=False)
-
-    def call(self, inputs, states, **kwargs):
-        def _conv(X, H):
-            k_ = int(H.get_shape()[0])
-            paddings = tf.constant(
-                [[0, 0], [k_ // 2, k_ // 2], [k_ // 2, k_ // 2], [0, 0]], dtype=tf.int32
-            )
-            X_pad = tf.pad(X, paddings, mode='SYMMETRIC')
-            H = tf.reshape(H, shape=(k_, k_, 1, 1))
-            return tf.nn.convolution(X_pad, H, padding='VALID')
-
-        _iter = tf.cast(tf.reshape(inputs, ()), tf.int32)
-
-        if _iter == 0:
-            h = states[0]
-            dog = h * 0.0
-        else:
-            h = _conv(tf.squeeze(states[0], axis=0), self.gaussian_kernels[_iter - 1])
-            h = tf.expand_dims(h, axis=0)
-            dog = math_ops.subtract(h, states[0])
-
-        gradient = tf.nn.convolution(tf.squeeze(h, axis=0), self.kernels_grad, padding='VALID')
-        gradient = tf.expand_dims(gradient, axis=0)
-
-        return [h, dog, gradient], [h]
+    orientation_N_bins: int = field(default=36, init=False)
+    eigen_ration: int = field(default=10, init=False)
+    peak_ratio: float = field(default=0.8, init=False)
+    contrast_threshold: float = field(default=0.04, init=False)
+    scale_factor: float = field(default=1.5, init=False)
+    extrema_offset: float = field(default=0.5, init=False)
+    radius_factor: int = field(default=3, init=False)
+    con: int = field(default=3, init=False)
+    descriptors_N_bins: int = field(default=8, init=False)
+    window_width: int = field(default=4, init=False)
+    scale_multiplier: int = field(default=3, init=False)
+    descriptor_max_value: float = field(default=0.2, init=False)
 
 
 class SIFT:
 
     def __init__(self,
-                 sigma: float = 1.6, assume_blur_sigma: float = 0.5, n_intervals: int = 3,
+                 sigma: float = 1.4, assume_blur_sigma: float = 0.5, n_intervals: int = 4,
                  n_octaves: Union[int, None] = 4, n_iterations: int = 5, name: Union[str, None] = None):
         self.__inputs_shape = None
+        self.__build = False
         self.name = name or 'SIFT'
         self.epsilon = 1e-05
-        self.n_octaves = None if n_octaves is None else n_octaves
+        self.n_octaves = n_octaves
         self.n_intervals = n_intervals
         self.n_iterations = n_iterations
         self.sigma = tf.cast(sigma, dtype=tf.float32)
         self.assume_blur_sigma = tf.cast(assume_blur_sigma, dtype=tf.float32)
         self.key_points = None
         self.descriptors_vectors = None
-        self.octave_pyramid = None
-        self.graph_args = Argumentor()
+        self.graph_args = Argumentor(
+            sigma=sigma, assume_blur_sigma=assume_blur_sigma, n_intervals=n_intervals,
+            n_iterations=n_iterations, n_octaves=n_octaves
+        )
+        self.base_kernel = None
+        self.gradient_kernel = None
+        self.gaussian_kernels = []
+        self.octave_pyramid = []
 
-    def __valid_input(self, inputs: tf.Tensor) -> None:
+    def __validate_input(self, inputs: tf.Tensor) -> tf.Tensor:
         _shape = inputs.get_shape()
         _ndims = len(_shape)
         if _ndims != 4 or _shape[-1] != 1:
@@ -176,11 +148,51 @@ class SIFT:
                 'expected the inputs to be grayscale images with size of (None, h, w, 1)'
             )
         self.__inputs_shape = _shape
+        inputs = tf.cast(inputs, dtype=tf.float32)
+        return inputs
 
-    def __localize_extrema(self, middle_pixel_cords: tf.Tensor, dOg_array: tf.Tensor,
+    def __init_graph(self):
+        _, _h, _w, _ = self.__inputs_shape
+
+        self.gaussian_kernels = []
+
+        delta_sigma = (self.graph_args.sigma ** 2) - ((2 * self.graph_args.assume_blur_sigma) ** 2)
+        delta_sigma = math_ops.sqrt(tf.maximum(delta_sigma, 0.64))
+
+        kernel = gaussian_kernel(kernel_size=0, sigma=delta_sigma)
+        kernel = tf.expand_dims(tf.expand_dims(kernel, axis=-1), axis=-1)
+        self.base_kernel = tf.Variable(kernel, trainable=False, name='base_kernel')
+
+        images_per_octaves = self.graph_args.n_intervals + 3
+        K = 2 ** (1 / self.graph_args.n_intervals)
+        K = tf.cast(K, dtype=tf.float32)
+
+        sigma_prev = (K ** tf.cast(tf.range(images_per_octaves - 1), dtype=tf.float32)) * self.graph_args.sigma
+        sigmas = math_ops.sqrt((K * sigma_prev) ** 2 - sigma_prev ** 2)
+        sigmas = math_ops.maximum(sigmas, 0.8)
+
+        for i, s in enumerate(sigmas):
+            kernel_ = gaussian_kernel(kernel_size=0, sigma=s)
+            kernel_ = tf.expand_dims(tf.expand_dims(kernel_, axis=-1), axis=-1)
+            self.gaussian_kernels.append(tf.Variable(kernel_, trainable=False, name=f'kernel{i}'))
+
+        kx = tf.constant([[0.0, 0.0, 0.0], [-1.0, 0.0, 1.0], [0.0, 0.0, 0.0]], dtype=tf.float32)
+        kx = tf.reshape(kx, shape=(3, 3, 1, 1))
+        ky = tf.constant([[0.0, -1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=tf.float32)
+        ky = tf.reshape(ky, shape=(3, 3, 1, 1))
+        self.gradient_kernel = tf.Variable(tf.concat((kx, ky), axis=-1), trainable=False, name='gradient_kernel')
+
+        min_shape = int(self.gaussian_kernels[-1].get_shape()[0])
+        max_n_octaves = self.compute_default_N_octaves(height=_h * 2, weight=_w * 2, min_shape=min_shape)
+
+        if self.graph_args.n_octaves is not None and max_n_octaves > self.graph_args.n_octaves:
+            max_n_octaves = tf.cast(self.graph_args.n_octaves, dtype=tf.int32)
+        self.graph_args.n_octaves = max_n_octaves
+
+    def __localize_extrema(self, middle_pixel_cords: tf.Tensor, dog: tf.Tensor,
                            octave_index: Union[int, float]) -> tuple[Union[tf.Tensor, None], Union[tf.Tensor, None]]:
 
-        dog_shape_ = dOg_array.shape
+        dog_shape_ = dog.shape
         args = self.graph_args
         cube_neighbor = make_neighborhood3D(middle_pixel_cords, con=args.con, origin_shape=dog_shape_)
         if cube_neighbor.shape[0] == 0:
@@ -191,7 +203,7 @@ class SIFT:
         _, middle_pixel_cords, _ = tf.split(cube_neighbor, [mid_index, 1, mid_index], axis=1)
         middle_pixel_cords = tf.reshape(middle_pixel_cords, shape=(-1, 4))
 
-        cube_values = tf.gather_nd(dOg_array, tf.reshape(cube_neighbor, shape=(-1, 4))) / 255.0
+        cube_values = tf.gather_nd(dog, tf.reshape(cube_neighbor, shape=(-1, 4))) / 255.0
         cube_values = tf.reshape(cube_values, (-1, args.con, args.con, args.con))
 
         cube_len_ = cube_values.get_shape()[0]
@@ -387,17 +399,19 @@ class SIFT:
         orientation = tf.where(math_ops.less(math_ops.abs(orientation), 1e-7), 0.0, orientation)
 
         p_id = tf.reshape(p_id, (-1,))
-        new_kp = {}
 
-        for key, itm in asdict(key_points).items():
-            if key == 'angle':
-                new_kp[key] = tf.reshape(orientation, (-1, 1))
-                continue
-            n = 1
-            if key == 'pt': n = 4
-            new_kp[key] = tf.reshape(tf.gather(itm, p_id), (-1, n))
+        prev_key_stack = key_points.stack()
+        prev_key_stack = tf.gather(prev_key_stack, p_id)
+        prev_key_split = tf.split(prev_key_stack, [4, 1, 1, 1, 1, 1], axis=-1)
 
-        key_points = KeyPoints(**new_kp)
+        key_points = KeyPoints(
+            pt=prev_key_split[0],
+            size=prev_key_split[1],
+            angle=tf.reshape(orientation, (-1, 1)),
+            octave=prev_key_split[3],
+            octave_id=prev_key_split[4],
+            response=prev_key_split[5]
+        )
 
         return histogram, key_points
 
@@ -502,104 +516,114 @@ class SIFT:
             histogram = tf.tensor_scatter_nd_add(histogram, cords, _C)
         return histogram
 
-    def call(self, inputs: tf.Tensor) -> tuple[KeyPoints, tf.Tensor]:
-        def unpack_rnn(x, dim):
-            if dim == 4: x = tf.squeeze(x, axis=-1)
-            x = tf.squeeze(x, axis=0)
-            x = tf.transpose(x, perm=[*range(1, dim), 0])
-            return x
-
-        def down_sample(x, size):
-            _h, _w, _d = size
-            _, x, _ = tf.split(x, [_d - 3, 1, _d - (_d - 3) - 1], axis=-1)
-            x = tf.image.resize(x, size=[_h, _w], method='nearest')
-            return x
-
-        def body(cords, x, oc_id, static_keys):
-            cords, keys = self.__localize_extrema(cords, x, oc_id)
-            if cords is None:
-                cords = tf.constant([[]], shape=(0, 4), dtype=tf.int64)
-            if keys is None:
-                return [cords, x, oc_id, static_keys]
-            static_keys = tf.concat((static_keys, keys), axis=0)
-            return [cords, x, oc_id, static_keys]
-
-        def cond_check(cords, x, oc_id, static_keys):
-            return cords.get_shape()[0] != 0
-
-        self.__valid_input(inputs)
-        B_, H_, W_, D_ = self.__inputs_shape
+    def build_graph(self, inputs: tf.Tensor) -> tuple[KeyPoints, tf.Tensor]:
+        inputs = self.__validate_input(inputs)
+        self.__init_graph()
         args = self.graph_args
+        _b, _h, _w, _ = self.__inputs_shape
 
-        X_base = tf.image.resize(inputs, size=[H_ * 2, W_ * 2], method='bilinear', name='X_base')
+        kernel = self.base_kernel
+        _k = kernel.get_shape()[0] // 2
+        paddings = tf.constant([[0, 0], [_k, _k], [_k, _k], [0, 0]], dtype=tf.int32)
 
-        delta_sigma = (self.sigma ** 2) - ((2 * self.assume_blur_sigma) ** 2)
-        delta_sigma = math_ops.sqrt(tf.maximum(delta_sigma, 0.64))
+        with tf.name_scope('Xbase'):
+            Xbase = image_ops.resize(inputs, size=[_h * 2, _w * 2], method='bilinear', name='Xb_up')
+            Xbase = tf.pad(Xbase, paddings, mode='SYMMETRIC')
+            Xbase = tf.nn.conv2d(Xbase, kernel, strides=[1, 1, 1, 1], padding='VALID', name='Xb_blur')
 
-        X_base = gaussian_blur(X_base, kernel_size=0, sigma=delta_sigma)
+        with tf.name_scope('octave_pyramid'):
+            maximum_iterations = args.n_octaves * len(self.gaussian_kernels)
+            cap = {0: [Xbase, tf.constant([], dtype=tf.float32), tf.constant([], dtype=tf.float32)]}
+            for i in range(1, args.n_octaves): cap[i] = [tf.constant([], dtype=tf.float32)] * 3
+            threshold = tf.floor(0.5 * args.contrast_threshold / 3.0 * 255.0)
+            key_points_warp = tf.constant([[]], shape=(0, 9), dtype=tf.float32)
 
-        # generate the gaussian kernels
-        images_per_octaves = self.n_intervals + 3
-        K = 2 ** (1 / self.n_intervals)
-        K = tf.cast(K, dtype=tf.float32)
+            def body(iter_, gaussian_kernels, grad_kernels, capture, shapes):
+                kernel_pointer = iter_ % len(gaussian_kernels)
+                cap_pointer = iter_ // len(gaussian_kernels)
 
-        sigma_prev = (K ** tf.cast(tf.range(images_per_octaves - 1), dtype=tf.float32)) * self.sigma
-        sigmas = math_ops.sqrt((K * sigma_prev) ** 2 - sigma_prev ** 2)
-        sigmas = math_ops.maximum(sigmas, 0.8)
+                gauss, dog, grad = capture.get(int(cap_pointer))
+                prev_state = tf.split(gauss, [kernel_pointer, 1], axis=-1)[-1]
 
-        gaussian_kernels = [gaussian_kernel(kernel_size=0, sigma=s) for s in sigmas]
+                kernel_ = gaussian_kernels[kernel_pointer]
+                k_pad = int(kernel_.get_shape()[0]) // 2
+                prev_state_pad = tf.pad(prev_state,
+                                        tf.constant([[0, 0], [k_pad, k_pad], [k_pad, k_pad], [0, 0]], dtype=tf.int32),
+                                        mode='SYMMETRIC')
+                curr_state = tf.nn.convolution(prev_state_pad, kernel_, padding='VALID')
 
-        min_shape = int(tf.shape(gaussian_kernels[-1])[0])
-        max_n_octaves = self.compute_default_N_octaves(image_shape=[B_, H_ * 2, W_ * 2, D_], min_shape=min_shape)
-        if self.n_octaves is not None and max_n_octaves > self.n_octaves:
-            max_n_octaves = tf.cast(self.n_octaves, dtype=tf.int32)
-        self.n_octaves = max_n_octaves
+                curr_grad = tf.nn.convolution(curr_state, grad_kernels, padding='VALID')
 
-        n_iterations = int(self.n_iterations)
-        threshold = tf.floor(0.5 * args.contrast_threshold / 3.0 * 255.0)
+                if kernel_pointer == 0: dog = math_ops.subtract(curr_state, prev_state)
+                if kernel_pointer > 0: dog = tf.concat((dog, math_ops.subtract(curr_state, prev_state)), axis=-1)
+                if iter_ == 0: grad = tf.expand_dims(tf.nn.convolution(prev_state, grad_kernels, padding='VALID'),
+                                                     axis=3)
 
-        _, hi, wi, _ = X_base.get_shape()
-        _N_per_oc = len(gaussian_kernels) + 1
-        iterator = tf.reshape(tf.cast(tf.range(_N_per_oc), tf.float32), (1, -1, 1))
+                gauss = tf.concat((gauss, curr_state), axis=-1)
+                grad = tf.concat((grad, tf.expand_dims(curr_grad, axis=3)), axis=3)
 
-        key_points = tf.constant([[]], shape=(0, 9), dtype=tf.float32)
-        self.octave_pyramid = []
+                capture[int(cap_pointer)] = [gauss, dog, grad]
+                iter_ = iter_ + 1
 
-        for oc in tf.range(self.n_octaves):
-            lay = OctaveRNN((B_, hi, wi, D_), gaussian_kernels, name=f'{oc}RNN')
-            lay = RNN(lay, return_sequences=True)
-            gauss, DoG, gradient = lay(iterator, initial_state=tf.expand_dims(X_base, axis=0))
+                if (iter_ % len(gaussian_kernels)) == 0 and (iter_ // len(gaussian_kernels)) < len(capture):
+                    iter_h, iter_w = shapes
+                    iter_d = len(gaussian_kernels) + 1
 
-            gauss = unpack_rnn(gauss, 4)
+                    _, next_base, _ = tf.split(gauss, [iter_d - 3, 1, iter_d - (iter_d - 3) - 1], axis=-1)
+                    next_base = image_ops.resize(next_base, size=[iter_h, iter_w], method='nearest')
 
-            DoG = unpack_rnn(DoG, 4)
-            _, DoG = tf.split(DoG, [1, _N_per_oc - 1], axis=-1)
+                    capture[int(cap_pointer) + 1][0] = next_base
+                    capture[int(cap_pointer) + 1][-1] = tf.expand_dims(
+                        tf.nn.convolution(next_base, grad_kernels, padding='VALID'), axis=3
+                    )
 
-            continue_search = compute_extrema3D(
-                DoG, threshold=threshold, con=args.con, border_width=args.border_width, epsilon=self.epsilon
+                    shapes = (iter_h // 2, iter_w // 2)
+                return [iter_, gaussian_kernels, grad_kernels, capture, shapes]
+
+            def cond(iter_, gaussian_kernels, grad_kernels, capture, shapes):
+                cap_pointer = iter_ // len(gaussian_kernels)
+                return cap_pointer < len(capture)
+
+            _, _, _, cap, _ = tf.while_loop(
+                cond=cond, body=body, loop_vars=[0, self.gaussian_kernels, self.gradient_kernel, cap, (_h, _w)],
+                maximum_iterations=maximum_iterations, parallel_iterations=1
             )
-            if continue_search.shape[0] != 0:
-                params = tf.while_loop(
-                    cond=cond_check,
-                    body=body,
-                    loop_vars=[continue_search, DoG, oc, key_points],
-                    maximum_iterations=n_iterations
+
+            def body(cords, x, oc_id, static_keys):
+                cords, keys = self.__localize_extrema(cords, x, oc_id)
+                if cords is None:
+                    cords = tf.constant([[]], shape=(0, 4), dtype=tf.int64)
+                if keys is None:
+                    return [cords, x, oc_id, static_keys]
+                static_keys = tf.concat((static_keys, keys), axis=0)
+                return [cords, x, oc_id, static_keys]
+
+            def cond(cords, x, oc_id, static_keys):
+                return cords.get_shape()[0] != 0
+
+            for oc_key, oc_tup in cap.items():
+                oc_gaussian, oc_dog, oc_grad = oc_tup
+                dx, dy = tf.unstack(oc_grad, 2, axis=-1)
+                magnitude = math_ops.sqrt(dx * dx + dy * dy)
+                orientation = math_ops.atan2(dx, dy) * (180.0 / PI)
+                self.octave_pyramid.append(Octave(oc_gaussian, dx, dy, magnitude, orientation))
+
+                continue_search = compute_extrema3D(
+                    oc_dog, threshold=threshold, con=args.con, border_width=args.border_width, epsilon=self.epsilon
                 )
-                key_points = params[-1]
-            gradient = unpack_rnn(gradient, 5) * 0.5
-            dx, dy = tf.unstack(gradient, 2, axis=3)
-            magnitude = math_ops.sqrt(dx * dx + dy * dy)
-            orientation = math_ops.atan2(dx, dy) * (180.0 / PI)
-            self.octave_pyramid.append(Octave(gauss, dx, dy, magnitude, orientation))
-            hi = hi // 2
-            wi = wi // 2
-            X_base = down_sample(gauss, (hi, wi, _N_per_oc))
+                if continue_search.shape[0] != 0:
+                    params = tf.while_loop(
+                        cond=cond,
+                        body=body,
+                        loop_vars=[continue_search, oc_dog, oc_key, key_points_warp],
+                        maximum_iterations=args.n_iterations
+                    )
+                    key_points_warp = params[-1]
 
-        key_points = KeyPoints(*tf.split(key_points, [4, 1, 1, 1, 1, 1], axis=-1))
+        key_points = KeyPoints(*tf.split(key_points_warp, [4, 1, 1, 1, 1, 1], axis=-1))
+
         histogram, self.key_points = self.__compute_histogram(key_points, self.octave_pyramid)
-
-        self.descriptors_vectors = self.write_descriptors(self.key_points, self.octave_pyramid)
-
+        # self.descriptors_vectors = self.write_descriptors(self.key_points, self.octave_pyramid)
         return self.key_points, self.descriptors_vectors
 
     def write_descriptors(self, key_points: KeyPoints, octaves: list[Octave]) -> tf.Tensor:
@@ -732,11 +756,8 @@ class SIFT:
             descriptors = tf.tensor_scatter_nd_add(descriptors, axs, tf.reshape(i_descriptor_vector, (-1,)))
         return descriptors
 
-    def compute_default_N_octaves(self, image_shape: Union[tf.Tensor, list, tuple], min_shape: int = 0) -> tf.Tensor:
-        assert len(image_shape) == 4
-        b, h, w, d = tf.unstack(image_shape, num=4)
-
-        s_ = tf.cast(min([h, w]), dtype=tf.float32)
+    def compute_default_N_octaves(self, height: int, weight: int, min_shape: int = 0) -> tf.Tensor:
+        s_ = tf.cast(min([height, weight]), dtype=tf.float32)
         diff = math_ops.log(s_)
         if min_shape > 1:
             diff = diff - math_ops.log(tf.cast(min_shape, dtype=tf.float32))
@@ -766,17 +787,10 @@ if __name__ == '__main__':
     img1 = tf.keras.utils.load_img('box.png', color_mode='grayscale')
     img1 = tf.convert_to_tensor(tf.keras.utils.img_to_array(img1), dtype=tf.float32)
     img1 = img1[tf.newaxis, ...]
-    img1 = tf.repeat(img1, repeats=2, axis=0)
+    # img1 = tf.repeat(img1, repeats=2, axis=0)
 
-    alg = SIFT(sigma=1.4, n_intervals=4, n_octaves=4)
-    # kp, disc = alg.call(img1)
+    alg = SIFT()
+    kp, disc = alg.build_graph(img1)
 
-    # flat = [tf.constant([[]] * 4, dtype=tf.float32)] + [tf.constant([[]], dtype=tf.float32)] * 5
-    # flat = [tf.transpose(fl, (1, 0)) for fl in flat]
-    # flat = type(kp)(*flat)
 
-    # def _map(k, i):
-    #     print(type(k), type(i))
-    #     return k
 
-    # a = tf.nest.map_structure(_map, kp, kp)
