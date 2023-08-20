@@ -6,6 +6,7 @@ from tensorflow.python.keras import backend
 from collections import namedtuple
 from dataclasses import dataclass, field
 
+# https://www.cs.ubc.ca/~lowe/papers/ijcv04.pdf
 
 backend.set_floatx('float32')
 linalg_ops = tf.linalg
