@@ -6,7 +6,7 @@ from tensorflow.python.keras import backend
 from collections import namedtuple
 from dataclasses import dataclass, field
 
-# TODO: floating point!!!
+
 backend.set_floatx('float32')
 linalg_ops = tf.linalg
 math_ops = tf.math
@@ -857,15 +857,22 @@ def show_key_points(key_points, image):
 
 
 if __name__ == '__main__':
-    img1 = tf.keras.utils.load_img('box.png', color_mode='grayscale')
+    img1 = tf.keras.utils.load_img('luka2.jpg', color_mode='grayscale')
     img1 = tf.convert_to_tensor(tf.keras.utils.img_to_array(img1), dtype=tf.float32)
     img1 = img1[tf.newaxis, ...]
-    # img1 = tf.repeat(img1, 2, axis=0)
 
-    alg1 = SIFT(sigma=1.6, n_octaves=4, n_intervals=3)
-    kp, disc1 = alg1.build_graph(img1)
+    img2 = tf.keras.utils.load_img('luka1.jpg', color_mode='grayscale')
+    img2 = tf.convert_to_tensor(tf.keras.utils.img_to_array(img2), dtype=tf.float32)
+    img2 = img2[tf.newaxis, ...]
 
-    # sp_kp, sp_disc = alg1.split_by_batch(kp, disc1)
+    alg = SIFT(sigma=1.6, n_octaves=4, n_intervals=3)
+    kp1, disc1 = alg.build_graph(img1)
+    kp2, disc2 = alg.build_graph(img2)
 
-    kpup = kp.to_image_size()
-    show_key_points(kpup, img1)
+
+    # kp_up = kp.to_image_size()
+    # show_key_points(kp_up, img1)
+    # sp_kp, sp_disc = alg.split_by_batch(kp, disc)
+
+
+
