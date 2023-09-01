@@ -117,10 +117,6 @@ class Argumentor:
     descriptor_max_value: float = field(default=0.2, init=False)
 
 
-def reduce_precision(X: tf.Tensor, precision_bits: int = 3) -> tf.Tensor:
-    scale = 2 ** precision_bits
-    return tf.round(scale * X) / scale
-
 
 class SIFT:
 
@@ -661,7 +657,7 @@ class SIFT:
                 magnitude = math_ops.sqrt(dx * dx + dy * dy)
                 orientation = math_ops.atan2(dx, dy) * (180.0 / PI)
                 self.octave_pyramid.append(Octave(oc_gaussian, dx, dy, magnitude, orientation))
-                oc_dog = reduce_precision(oc_dog, 3)
+                oc_dog = tf.cast(tf.cast(oc_dog, tf.uint8), tf.float32)
                 continue_search = compute_extrema3D(
                     oc_dog, threshold=threshold, con=args.con, border_width=args.border_width
                 )
