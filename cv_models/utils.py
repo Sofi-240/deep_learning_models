@@ -300,7 +300,7 @@ def compute_central_gradient2D(
         X = tf.transpose(X, perm=(0, 3, 1, 2))
         X = tf.reshape(X, shape=(b * d, h, w, 1))
         transpose = True
-    grad = tf.nn.convolution(X, kernels_dx, padding='VALID')
+    grad = tf.nn.convolution(X, kernels_dx, padding='VALID') * 0.5
     if transpose:
         grad = tf.reshape(grad, shape=(b, d, h - 2, w - 2, 2))
         grad = tf.transpose(grad, perm=(0, 2, 3, 1, 4))
