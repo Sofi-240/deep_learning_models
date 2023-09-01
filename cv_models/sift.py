@@ -27,7 +27,7 @@ class KeyPoints:
 
     def __post_init__(self):
         if not isinstance(self.pt, tf.Tensor):
-            raise ValueError('All the fields need to be type of Tensor')
+            raise ValueError('All the fields need to be type of tf.Tensor')
         _shape = self.pt.get_shape().as_list()
         if len(_shape) > 2:
             self.pt = tf.squeeze(self.pt)
@@ -117,12 +117,9 @@ class Argumentor:
     descriptor_max_value: float = field(default=0.2, init=False)
 
 
-def uint8(X: tf.Tensor) -> tf.Tensor:
-    return tf.cast(X, dtype=tf.uint8)
-
-
-def float32(X: tf.Tensor) -> tf.Tensor:
-    return tf.cast(X, dtype=tf.float32)
+def reduce_precision(X: tf.Tensor, precision_bits: int = 3) -> tf.Tensor:
+    scale = 2 ** precision_bits
+    return math_ops.round((scale * X) / scale)
 
 
 class SIFT:
@@ -664,9 +661,9 @@ class SIFT:
                 magnitude = math_ops.sqrt(dx * dx + dy * dy)
                 orientation = math_ops.atan2(dx, dy) * (180.0 / PI)
                 self.octave_pyramid.append(Octave(oc_gaussian, dx, dy, magnitude, orientation))
-                oc_dog = float32(uint8(oc_dog))
+                oc_dog = reduce_precision(oc_dog, 3)
                 continue_search = compute_extrema3D(
-                    float32(uint8(oc_dog)), threshold=threshold, con=args.con, border_width=args.border_width
+                    oc_dog, threshold=threshold, con=args.con, border_width=args.border_width
                 )
                 if continue_search.shape[0] != 0:
                     params = tf.while_loop(
@@ -681,6 +678,7 @@ class SIFT:
         histogram, key_points = self.__compute_histogram(key_points, self.octave_pyramid)
         self.key_points = self.__remove_duplicates(key_points)
         self.descriptors_vectors = self.write_descriptors(self.key_points, self.octave_pyramid)
+
         return self.key_points, self.descriptors_vectors
 
     def write_descriptors(self, key_points: KeyPoints, octaves: list[Octave]) -> tf.Tensor:
@@ -862,13 +860,13 @@ if __name__ == '__main__':
     img1 = tf.convert_to_tensor(tf.keras.utils.img_to_array(img1), dtype=tf.float32)
     img1 = img1[tf.newaxis, ...]
 
-    img2 = tf.keras.utils.load_img('luka1.jpg', color_mode='grayscale')
-    img2 = tf.convert_to_tensor(tf.keras.utils.img_to_array(img2), dtype=tf.float32)
-    img2 = img2[tf.newaxis, ...]
+    # img2 = tf.keras.utils.load_img('luka1.jpg', color_mode='grayscale')
+    # img2 = tf.convert_to_tensor(tf.keras.utils.img_to_array(img2), dtype=tf.float32)
+    # img2 = img2[tf.newaxis, ...]
 
     alg = SIFT(sigma=1.6, n_octaves=4, n_intervals=3)
     kp1, disc1 = alg.build_graph(img1)
-    kp2, disc2 = alg.build_graph(img2)
+    # kp2, disc2 = alg.build_graph(img2)
 
 
     # kp_up = kp.to_image_size()
