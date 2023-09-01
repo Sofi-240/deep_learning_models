@@ -119,7 +119,7 @@ class Argumentor:
 
 def reduce_precision(X: tf.Tensor, precision_bits: int = 3) -> tf.Tensor:
     scale = 2 ** precision_bits
-    return math_ops.round((scale * X) / scale)
+    return tf.round(scale * X) / scale
 
 
 class SIFT:
