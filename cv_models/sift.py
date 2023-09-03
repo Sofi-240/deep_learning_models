@@ -166,7 +166,7 @@ class SIFT:
         gaussian_kernels = []
 
         for i, s in enumerate(sigmas):
-            kernel_ = gaussian_kernel(kernel_size=0, sigma=s)
+            kernel_ = gaussian_kernel(kernel_size=3, sigma=s)
             gaussian_kernels.append(tf.expand_dims(tf.expand_dims(kernel_, axis=-1), axis=-1))
 
         kx = tf.constant([[0.0, 0.0, 0.0], [-1.0, 0.0, 1.0], [0.0, 0.0, 0.0]], shape=(3, 3, 1, 1), dtype=tf.float32)
@@ -204,7 +204,7 @@ class SIFT:
         hess = compute_hessian_3D(dog)
 
         # x' = - (D^2D / Dx^2) * (DD / Dx)
-        extrema_update = - linalg_ops.solve(hess, grad)
+        extrema_update = - linalg_ops.lstsq(hess, grad, fast=False)
         extrema_update = tf.squeeze(extrema_update, axis=-1)
 
         # (DD / Dx) * x'
@@ -235,6 +235,7 @@ class SIFT:
         # ---> ((Dxx + Dyy) ^ 2) * r < (Dxx * Dyy - Dxy * Dyx) * ((r + 1) ^ 2)
         kp_cond3 = math_ops.less(args.eigen_ration * (hess_xy_trace ** 2), ((args.eigen_ration + 1) ** 2) * hess_xy_det)
         cond = tf.where(kp_cond1 & kp_cond2 & kp_cond3, True, False)
+
 
         kp_cond4 = tf.scatter_nd(extrema, tf.ones((extrema.shape[0],), dtype=tf.bool), dog_shape)
         kp_cond4 = tf.slice(kp_cond4, [0, 1, 1, 1],
