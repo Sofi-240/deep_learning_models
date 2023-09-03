@@ -194,7 +194,7 @@ class SIFT:
         # e = (x, y, sigma)
         extrema = compute_extrema3D(dog, con=args.con, border_width=args.border_width)
 
-        dog = self.__scale(tf.abs(dog), -1, 1)
+        dog = self.__scale(dog, -1, 1)
 
         # DD / Dx
         grad = compute_central_gradient3D(dog)
