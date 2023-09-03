@@ -104,7 +104,7 @@ class Argumentor:
     orientation_N_bins: int = field(default=36, init=False)
     eigen_ration: int = field(default=10, init=False)
     peak_ratio: float = field(default=0.8, init=False)
-    contrast_threshold: float = field(default=0.04, init=False)
+    contrast_threshold: float = field(default=0.03, init=False)
     scale_factor: float = field(default=1.5, init=False)
     extrema_offset: float = field(default=0.5, init=False)
     radius_factor: int = field(default=3, init=False)
@@ -186,47 +186,55 @@ class SIFT:
         args = self.graph_args
         dim = octave.shape[-1]
 
+        # D(None, x, y, sigma)
         dog = math_ops.subtract(tf.split(octave.gaussian, [1, dim - 1], -1)[1],
                                 tf.split(octave.gaussian, [dim - 1, 1], -1)[0])
         dog_shape = dog.get_shape().as_list()
 
+        # e = (x, y, sigma)
         extrema = compute_extrema3D(dog, con=args.con, border_width=args.border_width)
 
         dog = self.__scale(tf.abs(dog), -1, 1)
+
+        # DD / Dx
         grad = compute_central_gradient3D(dog)
         grad = tf.expand_dims(grad, -1)
 
+        # D^2D / Dx^2
         hess = compute_hessian_3D(dog)
-        # TODO: the problem is here!!!
-        extrema_update = - linalg_ops.lstsq(hess, grad, l2_regularizer=0.0, fast=False)
+
+        # x' = - (D^2D / Dx^2) * (DD / Dx)
+        extrema_update = - linalg_ops.solve(hess, grad)
         extrema_update = tf.squeeze(extrema_update, axis=-1)
 
-        dot_ = tf.reduce_sum(
-            tf.multiply(tf.expand_dims(extrema_update, 3), tf.transpose(grad, perm=(0, 1, 2, 5, 3, 4))),
-            axis=-1, keepdims=False
-        )
-        dot_ = tf.squeeze(dot_, 3)
+        # (DD / Dx) * x'
+        dot_ = linalg_ops.matmul(tf.expand_dims(extrema_update, 4), grad)
+        dot_ = tf.squeeze(tf.squeeze(dot_, -1), -1)
 
         mid_cube_values = tf.slice(dog, [0, 1, 1, 1],
                                    [dog_shape[0], dog_shape[1] - 2, dog_shape[2] - 2, dog_shape[3] - 2])
+
+        # D(x') = D + 0.5 * (DD / Dx) * x'
         update_response = mid_cube_values + 0.5 * dot_
 
         hess_shape = hess.get_shape().as_list()
+        # H[[Dxx, Dxy], [Dyx, Dyy]]
         hess_xy = tf.slice(hess, [0, 0, 0, 0, 0, 0], [*hess_shape[:-2], 2, 2])
+        # Dxx + Dyy
         hess_xy_trace = linalg_ops.trace(hess_xy)
+        # Dxx * Dyy - Dxy * Dyx
         hess_xy_det = linalg_ops.det(hess_xy)
 
+        # |x'| < 0.5
         kp_cond1 = math_ops.less(math_ops.reduce_max(math_ops.abs(extrema_update), axis=-1), args.extrema_offset)
 
-        kp_cond2 = math_ops.greater_equal(
-            math_ops.abs(update_response) * int(args.n_intervals), args.contrast_threshold
-        )
+        # |D(x')| >= 0.03
+        kp_cond2 = math_ops.greater_equal(math_ops.abs(update_response), args.contrast_threshold)
 
-        kp_cond3 = math_ops.logical_and(
-            math_ops.greater(hess_xy_det, 0.0),
-            math_ops.less(args.eigen_ration * (hess_xy_trace ** 2), ((args.eigen_ration + 1) ** 2) * hess_xy_det)
-        )
-        cond = math_ops.logical_and(kp_cond1, math_ops.logical_and(kp_cond2, kp_cond3))
+        # (Dxx + Dyy) ^ 2 / Dxx * Dyy - Dxy * Dyx < (r + 1) ^ 2 / r
+        # ---> ((Dxx + Dyy) ^ 2) * r < (Dxx * Dyy - Dxy * Dyx) * ((r + 1) ^ 2)
+        kp_cond3 = math_ops.less(args.eigen_ration * (hess_xy_trace ** 2), ((args.eigen_ration + 1) ** 2) * hess_xy_det)
+        cond = tf.where(kp_cond1 & kp_cond2 & kp_cond3, True, False)
 
         kp_cond4 = tf.scatter_nd(extrema, tf.ones((extrema.shape[0],), dtype=tf.bool), dog_shape)
         kp_cond4 = tf.slice(kp_cond4, [0, 1, 1, 1],
@@ -815,8 +823,8 @@ def templet_matching(tmp_img, dst_img, tmp_kp, dst_kp, tmp_dsc, dst_dsc):
         if m.distance < 0.7 * n.distance:
             good.append(m)
 
-    if len(good) < 10:
-        print('number of matches smaller then 10')
+    if len(good) < 2:
+        print('number of matches smaller then 2')
         return
 
     src_index = [m.queryIdx for m in good]
@@ -869,7 +877,7 @@ if __name__ == '__main__':
 
     alg = SIFT(sigma=1.6, n_intervals=3)
     kp1, disc1 = alg(img1)
-    # kp2, disc2 = alg(img2)
+    kp2, disc2 = alg(img2)
 
     # show_key_points(kp1.to_image_size(), img1)
     # show_key_points(kp2.to_image_size(), img2)
