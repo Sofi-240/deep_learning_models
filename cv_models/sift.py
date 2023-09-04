@@ -195,7 +195,6 @@ class SIFT:
         extrema = compute_extrema3D(tf.round(dog), con=args.con,
                                     border_width=[w - 2 if w != 0 else 0 for w in args.border_width])
 
-        # dog = self.__scale(dog, -1, 1)
         dog = dog / 255.0
 
         # DD / Dx
@@ -206,7 +205,7 @@ class SIFT:
         hess = compute_hessian_3D(dog)
 
         # x' = - (D^2D / Dx^2) * (DD / Dx)
-        extrema_update = - linalg_ops.solve(hess, grad)  # may cause a problem lstsq(hess, grad, fast=False)
+        extrema_update = - linalg_ops.lstsq(hess, grad, fast=False)
         extrema_update = tf.squeeze(extrema_update, axis=-1)
 
         # (DD / Dx) * x'
@@ -798,7 +797,7 @@ def show_key_points(key_points, image):
 
     cords = tf.cast(key_points.pt, dtype=tf.int64) * tf.constant([1, 1, 1, 0], dtype=tf.int64)
 
-    marks = make_neighborhood2D(cords, con=3, origin_shape=image.shape)
+    marks = make_neighborhood2D(cords, con=5, origin_shape=image.shape)
     marks = tf.reshape(marks, shape=(-1, 4))
     marked = tf.scatter_nd(marks, tf.ones(shape=(marks.get_shape()[0],), dtype=tf.float32) * 255.0, shape=image.shape)
     marked_del = math_ops.abs(marked - 255.0) / 255.0
@@ -877,19 +876,17 @@ def templet_matching(tmp_img, dst_img, tmp_kp, dst_kp, tmp_dsc, dst_dsc):
 
 
 if __name__ == '__main__':
-    img1 = tf.keras.utils.load_img('box.png', color_mode='grayscale')
+    img1 = tf.keras.utils.load_img('luka1.jpeg', color_mode='grayscale')
     img1 = tf.convert_to_tensor(tf.keras.utils.img_to_array(img1), dtype=tf.float32)
     img1 = img1[tf.newaxis, ...]
 
-    img2 = tf.keras.utils.load_img('box_in_scene.png', color_mode='grayscale')
-    img2 = tf.convert_to_tensor(tf.keras.utils.img_to_array(img2), dtype=tf.float32)
-    img2 = img2[tf.newaxis, ...]
-
     alg = SIFT(sigma=1.6, n_intervals=3)
     kp1, disc1 = alg(img1)
+    show_key_points(kp1.to_image_size(), img1)
     # kp2, disc2 = alg(img2)
 
     # show_key_points(kp1.to_image_size(), img1)
     # show_key_points(kp2.to_image_size(), img2)
 
     # templet_matching(img1, img2, kp1, kp2, disc1, disc2)
+
