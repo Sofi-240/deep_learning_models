@@ -166,7 +166,7 @@ class SIFT:
         gaussian_kernels = []
 
         for i, s in enumerate(sigmas):
-            kernel_ = gaussian_kernel(kernel_size=3, sigma=s)
+            kernel_ = gaussian_kernel(kernel_size=0, sigma=s)
             gaussian_kernels.append(tf.expand_dims(tf.expand_dims(kernel_, axis=-1), axis=-1))
 
         kx = tf.constant([[0.0, 0.0, 0.0], [-1.0, 0.0, 1.0], [0.0, 0.0, 0.0]], shape=(3, 3, 1, 1), dtype=tf.float32)
@@ -186,15 +186,17 @@ class SIFT:
         args = self.graph_args
         dim = octave.shape[-1]
 
-        # D(None, x, y, sigma)
+        # D(None, y, x, sigma)
         dog = math_ops.subtract(tf.split(octave.gaussian, [1, dim - 1], -1)[1],
                                 tf.split(octave.gaussian, [dim - 1, 1], -1)[0])
         dog_shape = dog.get_shape().as_list()
 
-        # e = (x, y, sigma)
-        extrema = compute_extrema3D(dog, con=args.con, border_width=args.border_width)
+        # e = (y, x, sigma)
+        extrema = compute_extrema3D(tf.round(dog), con=args.con,
+                                    border_width=[w - 2 if w != 0 else 0 for w in args.border_width])
 
-        dog = self.__scale(dog, -1, 1)
+        # dog = self.__scale(dog, -1, 1)
+        dog = dog / 255.0
 
         # DD / Dx
         grad = compute_central_gradient3D(dog)
@@ -204,7 +206,7 @@ class SIFT:
         hess = compute_hessian_3D(dog)
 
         # x' = - (D^2D / Dx^2) * (DD / Dx)
-        extrema_update = - linalg_ops.lstsq(hess, grad, fast=False)
+        extrema_update = - linalg_ops.solve(hess, grad)  # may cause a problem lstsq(hess, grad, fast=False)
         extrema_update = tf.squeeze(extrema_update, axis=-1)
 
         # (DD / Dx) * x'
@@ -236,7 +238,6 @@ class SIFT:
         kp_cond3 = math_ops.less(args.eigen_ration * (hess_xy_trace ** 2), ((args.eigen_ration + 1) ** 2) * hess_xy_det)
         cond = tf.where(kp_cond1 & kp_cond2 & kp_cond3, True, False)
 
-
         kp_cond4 = tf.scatter_nd(extrema, tf.ones((extrema.shape[0],), dtype=tf.bool), dog_shape)
         kp_cond4 = tf.slice(kp_cond4, [0, 1, 1, 1],
                             [dog_shape[0], dog_shape[1] - 2, dog_shape[2] - 2, dog_shape[3] - 2])
@@ -259,7 +260,7 @@ class SIFT:
         _prob = tf.stack((_one, _prob, _prob, _one), axis=-1)
         _prob = tf.squeeze(_prob)
 
-        region_center = tf.cast(key_points.pt * _prob, dtype=tf.int64) - tf.constant([[0, 1, 1, 0]], dtype=tf.int64)
+        region_center = tf.cast(key_points.pt * _prob, dtype=tf.int64)
 
         con = tf.reshape((radius * 2) + 1, (-1,))
         octave_id = tf.reshape(tf.cast(key_points.octave_id, tf.int32), (-1,))
@@ -337,7 +338,7 @@ class SIFT:
 
         orientation = 360. - interpolated_peak_index * 360. / args.orientation_N_bins
 
-        orientation = tf.where(math_ops.less(math_ops.abs(orientation), 1e-7), 0.0, orientation)
+        orientation = tf.where(math_ops.less(math_ops.abs(orientation - 360.), 1e-7), 0.0, orientation)
 
         p_id = tf.reshape(p_id, (-1,))
 
@@ -518,10 +519,14 @@ class SIFT:
         _, h_, w_, _ = self.__inputs_shape
         args = self.graph_args
 
-        inputs = self.__scale(inputs, 0, 255)
+        def conv_with_pad(x, h):
+            k_ = h.get_shape()[0] // 2
+            x = tf.pad(x, tf.constant([[0, 0], [k_, k_], [k_, k_], [0, 0]], tf.int32), 'SYMMETRIC')
+            return tf.nn.convolution(x, h, padding='VALID')
+
         with tf.name_scope('Xbase'):
             X_base = image_ops.resize(inputs, size=[h_ * 2, w_ * 2], method='bilinear', name='Xb_up')
-            X_base = tf.nn.conv2d(X_base, self.kernels.base, strides=[1, 1, 1, 1], padding='SAME', name='Xb_blur')
+            X_base = conv_with_pad(X_base, self.kernels.base)
 
         with tf.name_scope('octave_pyramid'):
             gaussian_kernels = self.kernels.gaussian
@@ -536,7 +541,7 @@ class SIFT:
                 grad_cap = [grad]
 
                 for kernel in gaussian_kernels:
-                    X = tf.nn.convolution(X, kernel, padding='SAME')
+                    X = conv_with_pad(X, kernel)
                     grad = tf.expand_dims(tf.nn.convolution(X, grad_kernels, padding='VALID'), axis=3)
                     gauss_cap.append(X)
                     grad_cap.append(grad)
@@ -551,7 +556,7 @@ class SIFT:
 
                 dx, dy = tf.unstack(grad_cap, 2, axis=-1)
                 magnitude = math_ops.sqrt(dx * dx + dy * dy)
-                orientation = math_ops.atan2(dx, dy) * (180.0 / PI)
+                orientation = math_ops.atan2(dy, dx) * (180.0 / PI)
                 oc = Octave(gauss_cap, dx, dy, magnitude, orientation)
                 self.octave_pyramid.append(oc)
 
@@ -593,7 +598,7 @@ class SIFT:
                     cords = tf.where(sure_key_points)
                     if cords.shape[0] == 0: continue
                     kp_cords = cords + tf.constant([[0, 1, 1, 1]], dtype=tf.int64)
-
+                    # x' = - (D^2D / Dx^2) * (DD / Dx)
                     kp_extrema_update = tf.gather_nd(extrema_oc.extrema_update, cords)
 
                     octave_index = tf.cast(oc_id, dtype=tf.float32)
@@ -601,10 +606,11 @@ class SIFT:
                     ex, ey, ez = tf.unstack(kp_extrema_update, num=3, axis=1)
                     cd, cy, cx, cz = tf.unstack(tf.cast(kp_cords, tf.float32), num=4, axis=1)
 
+                    # x = (batch, y, x, layer)
                     kp_pt = tf.stack(
                         (cd, (cy + ey) * (2 ** octave_index), (cx + ex) * (2 ** octave_index), cz), axis=-1
                     )
-
+                    # kp_octave = oc_id + bitwise_ops.left_shift(tf.cast(cz, tf.int32), 8) + bitwise_ops.left_shift(tf.cast(tf.round((ez + 0.5) * 255.0), tf.int32), 16)
                     kp_octave = octave_index + cz * (2 ** 8) + tf.round((ez + 0.5) * 255.0) * (2 ** 16)
 
                     kp_size = args.sigma * (2 ** ((cz + ez) / tf.cast(args.n_intervals, dtype=tf.float32))) * (
@@ -828,6 +834,9 @@ def templet_matching(tmp_img, dst_img, tmp_kp, dst_kp, tmp_dsc, dst_dsc):
         print('number of matches smaller then 2')
         return
 
+    good.sort(key=lambda x: x.distance)
+    good = good[:min(len(good), 50)]
+
     src_index = [m.queryIdx for m in good]
     dst_index = [m.trainIdx for m in good]
 
@@ -878,20 +887,9 @@ if __name__ == '__main__':
 
     alg = SIFT(sigma=1.6, n_intervals=3)
     kp1, disc1 = alg(img1)
-    kp2, disc2 = alg(img2)
+    # kp2, disc2 = alg(img2)
 
     # show_key_points(kp1.to_image_size(), img1)
     # show_key_points(kp2.to_image_size(), img2)
 
     # templet_matching(img1, img2, kp1, kp2, disc1, disc2)
-
-    # oc = alg.octave_pyramid
-    #
-    # from viz import show_images
-    #
-    # g = oc[2].gaussian
-    # show_images(tf.transpose(g, (3, 1, 2, 0)), 3, 2)
-    #
-    # dog = math_ops.subtract(tf.split(g, [1, 6 - 1], -1)[1],
-    #                         tf.split(g, [6 - 1, 1], -1)[0])
-    # show_images(tf.transpose(((dog - tf.reduce_min(dog)) / (tf.reduce_max(dog) - tf.reduce_min(dog))), (3, 1, 2, 0)), 3, 2)
