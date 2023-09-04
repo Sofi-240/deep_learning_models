@@ -195,16 +195,12 @@ def compute_extrema3D(
 
     half_con = [c // 2 for c in con]
 
-    x_con = tf.concat((X, X * -1.0), axis=-1)
+    x_con = tf.concat((tf.expand_dims(X, -1), tf.expand_dims(X, -1) * -1.), -1)
 
-    ex = tf.nn.max_pool2d(x_con, ksize=(3, 3), strides=[1, 1], padding='VALID')
-    ex = tf.transpose(ex, perm=(0, 1, 3, 2))
-    ex = tf.nn.max_pool2d(ex, ksize=(1, 3), strides=[1, 1], padding='VALID')
-    ex = tf.transpose(ex, perm=(0, 1, 3, 2))
+    extrema = tf.nn.max_pool3d(x_con, ksize=con, strides=[1, 1, 1], padding='VALID')
 
-    e_ = int((d * 2) - 2)
-    extrema_max, _, extrema_min = tf.split(ex, [(e_ // 2) - 1, 2, (e_ // 2) - 1], axis=-1)
-    extrema_min = extrema_min * -1.0
+    extrema_max, extrema_min = tf.unstack(extrema, 2, -1)
+    extrema_min = extrema_min * -1.
 
     compare_array = tf.slice(X, [0, *half_con], [b, h - 2 * half_con[0], w - 2 * half_con[1], d - 2 * half_con[2]])
 
