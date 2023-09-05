@@ -152,6 +152,13 @@ class KeyPoints:
         return _stack
 
 
+class Descriptor:
+    def __init__(self, bins: int = 8, window_width: int = 4, scale_multiplier: int = 3):
+        self.N_bins = bins
+        self.window_width = window_width
+        self.scale_multiplier = scale_multiplier
+
+
 class Detector:
     def __init__(self, sigma: float = 1.6, assume_blur_sigma: float = 0.5, n_intervals: int = 3,
                  n_octaves: Union[int, None] = None, border_width: int = 5, convergence_iter: int = 5):
@@ -366,7 +373,7 @@ class Detector:
         kp_octave = octave_index + cz * (2 ** 8) + tf.round((ez + 0.5) * 255.0) * (2 ** 16)
 
         # size = (sigma << ((s + s') / sn)) << (octave_index + 1)
-        kp_size = self.sigma * (2 ** ((cz + ez) / tf.cast(self.n_intervals, dtype=tf.float32))) * (
+        kp_size = self.sigma * (2 ** ((cz + ez) / tf.cast(dim - 3, dtype=tf.float32))) * (
                 2 ** (octave_index + 1.0))
 
         # D(X') = D + 0.5 * (DD / Dx) * X'
@@ -494,19 +501,10 @@ class Detector:
         self.__init_graph(self.__inputs_shape)
         return self.__graph(inputs, levels_ex_=1)
 
-    def extract_keypoints(self, inputs: Union[tf.Tensor, OctavePyramid]) -> KeyPoints:
-        if isinstance(inputs, tf.Tensor):
-            inputs = self.__validate_input(inputs)
-            self.__init_graph(self.__inputs_shape)
-            return self.__graph(inputs, levels_ex_=2)
-        if isinstance(inputs, OctavePyramid): raise TypeError
-
-        key_points = KeyPoints()
-        for oc in inputs:
-            oc_kp = self.localize_extrema(oc)
-            if oc_kp.shape[0] == 0: continue
-            key_points += self.orientation_assignment(oc, oc_kp)
-        return key_points
+    def extract_keypoints(self, inputs: tf.Tensor) -> KeyPoints:
+        inputs = self.__validate_input(inputs)
+        self.__init_graph(self.__inputs_shape)
+        return self.__graph(inputs, levels_ex_=2)
 
     @staticmethod
     def compute_default_N_octaves(height: int, weight: int, min_shape: int = 0) -> int:
