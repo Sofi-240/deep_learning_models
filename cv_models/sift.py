@@ -162,12 +162,7 @@ class Detector:
         self.n_octaves = n_octaves
         self.border_width = (border_width, border_width, 0)
         self.convergence_N = convergence_iter
-        self.pyramid = OctavePyramid()
         self.pyramid_kernels = []
-        self.key_points = KeyPoints()
-
-    def __call__(self, inputs: tf.Tensor):
-        return self.call(inputs)
 
     def __validate_input(self, inputs: tf.Tensor) -> tf.Tensor:
         _shape = inputs.get_shape().as_list()
@@ -181,8 +176,6 @@ class Detector:
         return inputs
 
     def __init_graph(self, inputs_shape: Union[tf.Tensor, list, tuple]):
-        self.pyramid = OctavePyramid()
-        self.key_points = KeyPoints()
         _, h_, w_, _ = inputs_shape
         delta_sigma = (self.sigma ** 2) - ((2 * self.assume_blur_sigma) ** 2)
         delta_sigma = math_ops.sqrt(tf.maximum(delta_sigma, 0.64))
@@ -208,6 +201,43 @@ class Detector:
         if self.n_octaves is not None and max_n_octaves > self.n_octaves:
             max_n_octaves = self.n_octaves
         self.n_octaves = max_n_octaves
+
+    def __graph(self, inputs: tf.Tensor, levels_ex_: int) -> Union[KeyPoints, OctavePyramid]:
+        def conv_with_pad(x, h):
+            k_ = h.get_shape()[0] // 2
+            x = tf.pad(x, tf.constant([[0, 0], [k_, k_], [k_, k_], [0, 0]], tf.int32), 'SYMMETRIC')
+            return tf.nn.convolution(x, h, padding='VALID')
+
+        # I[batch, y, x, 1]
+        _, h_, w_, _ = self.__inputs_shape
+
+        G_yxs = self.pyramid_kernels
+
+        # I[batch, H, W, 1] --> I[batch, 2 * H, 2 * W, 1]
+        I = image_ops.resize(inputs, size=[h_ * 2, w_ * 2], method='bilinear')
+        I = conv_with_pad(I, G_yxs[0])
+
+        size_ = [h_, w_]
+        pyramid = OctavePyramid()
+        key_points = KeyPoints()
+        for oc_id in range(self.n_octaves):
+            oc_cap = [I]
+            for kernel in G_yxs[1:]:
+                I = conv_with_pad(I, kernel)
+                oc_cap.append(I)
+            if oc_id < self.n_octaves - 1:
+                I = image_ops.resize(oc_cap[-3], size=size_, method='nearest')
+                size_[0] //= 2
+                size_[1] //= 2
+
+            pyramid.append(tf.concat(oc_cap, -1))
+            if levels_ex_ == 1: continue
+            oc = pyramid[-1]
+            oc_kp = self.localize_extrema(oc)
+            if oc_kp.shape[0] == 0: continue
+            key_points += self.orientation_assignment(oc, oc_kp)
+
+        return pyramid if levels_ex_ == 1 else key_points
 
     def localize_extrema(self, octave: OctavePyramid.Octave) -> KeyPoints:
         dim = octave.shape[-1]
@@ -459,6 +489,25 @@ class Detector:
 
         return key_points_new
 
+    def octave_pyramid(self, inputs: tf.Tensor) -> OctavePyramid:
+        inputs = self.__validate_input(inputs)
+        self.__init_graph(self.__inputs_shape)
+        return self.__graph(inputs, levels_ex_=1)
+
+    def extract_keypoints(self, inputs: Union[tf.Tensor, OctavePyramid]) -> KeyPoints:
+        if isinstance(inputs, tf.Tensor):
+            inputs = self.__validate_input(inputs)
+            self.__init_graph(self.__inputs_shape)
+            return self.__graph(inputs, levels_ex_=2)
+        if isinstance(inputs, OctavePyramid): raise TypeError
+
+        key_points = KeyPoints()
+        for oc in inputs:
+            oc_kp = self.localize_extrema(oc)
+            if oc_kp.shape[0] == 0: continue
+            key_points += self.orientation_assignment(oc, oc_kp)
+        return key_points
+
     @staticmethod
     def compute_default_N_octaves(height: int, weight: int, min_shape: int = 0) -> int:
         s_ = tf.cast(min([height, weight]), dtype=tf.float32)
@@ -469,45 +518,11 @@ class Detector:
         n_octaves = tf.round(diff / math_ops.log(2.0)) + 1
         return int(n_octaves)
 
-    def call(self, inputs: tf.Tensor):
-        # I[batch, y, x, 1]
-        inputs = self.__validate_input(inputs)
-        self.__init_graph(self.__inputs_shape)
-        _, h_, w_, _ = self.__inputs_shape
-
-        def conv_with_pad(x, h):
-            k_ = h.get_shape()[0] // 2
-            x = tf.pad(x, tf.constant([[0, 0], [k_, k_], [k_, k_], [0, 0]], tf.int32), 'SYMMETRIC')
-            return tf.nn.convolution(x, h, padding='VALID')
-
-        G_yxs = self.pyramid_kernels
-
-        # I[batch, H, W, 1] --> I[batch, 2 * H, 2 * W, 1]
-        I = image_ops.resize(inputs, size=[h_ * 2, w_ * 2], method='bilinear')
-        I = conv_with_pad(I, G_yxs[0])
-
-        size_ = [h_, w_]
-        for oc_id in range(self.n_octaves):
-            oc_cap = [I]
-            for kernel in G_yxs[1:]:
-                I = conv_with_pad(I, kernel)
-                oc_cap.append(I)
-            if oc_id < self.n_octaves - 1:
-                I = image_ops.resize(oc_cap[-3], size=size_, method='nearest')
-                size_[0] //= 2
-                size_[1] //= 2
-            self.pyramid.append(tf.concat(oc_cap, -1))
-            oc = self.pyramid[-1]
-            oc_kp = self.localize_extrema(oc)
-            if oc_kp.shape[0] == 0: continue
-            self.key_points += self.orientation_assignment(oc, oc_kp)
-        return self.key_points
-
 
 if __name__ == '__main__':
-    image = load_image('luka1.jpeg')
+    image = load_image('box.png')
     alg = Detector()
 
-    kp = alg(image)
+    kp = alg.extract_keypoints(image)
 
     # show_key_points(kp.to_image_size(), image)
