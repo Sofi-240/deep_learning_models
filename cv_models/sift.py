@@ -13,6 +13,7 @@ linalg_ops = tf.linalg
 math_ops = tf.math
 bitwise_ops = tf.bitwise
 image_ops = tf.image
+unpacked_octave = namedtuple('unpacked_octave', 'octave, layer, scale')
 
 
 def load_image(name: str) -> tf.Tensor:
@@ -21,12 +22,12 @@ def load_image(name: str) -> tf.Tensor:
     return im[tf.newaxis, ...]
 
 
-def show_key_points(key_points, image):
+def show_key_points(key_points, img):
     from viz import show_images
 
     cords = tf.cast(key_points.pt, dtype=tf.int64) * tf.constant([1, 1, 1, 0], dtype=tf.int64)
 
-    marks = make_neighborhood2D(cords, con=3, origin_shape=image.shape)
+    marks = make_neighborhood2D(cords, con=3, origin_shape=img.shape)
     marks = tf.reshape(marks, shape=(-1, 4))
 
     # r = 3
@@ -34,14 +35,80 @@ def show_key_points(key_points, image):
     # x, y = tf.meshgrid(ax, ax)
     # ax = tf.cast(tf.where(x ** 2 + y ** 2 <= r ** 2, 1, 0), tf.float32)
 
-    marked = tf.scatter_nd(marks, tf.ones(shape=(marks.get_shape()[0],), dtype=tf.float32) * 255.0, shape=image.shape)
+    marked = tf.scatter_nd(marks, tf.ones(shape=(marks.get_shape()[0],), dtype=tf.float32) * 255.0, shape=img.shape)
     marked_del = math_ops.abs(marked - 255.0) / 255.0
-    img_mark = image * marked_del
+    img_mark = img * marked_del
 
-    marked = tf.concat((marked, tf.zeros_like(image), tf.zeros_like(image)), axis=-1)
+    marked = tf.concat((marked, tf.zeros_like(img), tf.zeros_like(img)), axis=-1)
 
     img_mark = img_mark + marked
     show_images(img_mark, 1, 1)
+
+
+def templet_matching(tmp_img, dst_img, tmp_kp, dst_kp, tmp_dsc, dst_dsc):
+    import cv2
+    import numpy as np
+    from viz import show_images
+
+    FLANN_INDEX_KDTREE = 0
+    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+    search_params = dict(checks=50)
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+
+    tmp_dsc = tmp_dsc.numpy()
+    dst_dsc = dst_dsc.numpy()
+
+    matches = flann.knnMatch(tmp_dsc, dst_dsc, k=2)
+
+    good = []
+    for m, n in matches:
+        if m.distance < 0.7 * n.distance:
+            good.append(m)
+
+    if len(good) < 2:
+        print('number of matches smaller then 2')
+        return
+
+    good.sort(key=lambda x: x.distance)
+    good = good[:min(len(good), 50)]
+
+    src_index = [m.queryIdx for m in good]
+    dst_index = [m.trainIdx for m in good]
+
+    src_pt = tf.gather(tmp_kp.to_image_size().pt, tf.constant(src_index, dtype=tf.int32))
+    dst_pt = tf.gather(dst_kp.to_image_size().pt, tf.constant(dst_index, dtype=tf.int32))
+
+    src_pt = tf.split(src_pt, [1, 2, 1], -1)[1].numpy().astype(int).reshape(-1, 1, 2)
+    dst_pt = tf.split(dst_pt, [1, 2, 1], -1)[1].numpy().astype(int).reshape(-1, 1, 2)
+
+    M = cv2.findHomography(src_pt, dst_pt, cv2.RANSAC, 5.0)[0]
+
+    _, h, w, _ = tmp_img.shape
+
+    pts = np.float32([[0, 0],
+                      [0, h - 1],
+                      [w - 1, h - 1],
+                      [w - 1, 0]]).reshape(-1, 1, 2)
+    dst = cv2.perspectiveTransform(pts, M)
+
+    dst_img = cv2.polylines(tf.squeeze(dst_img).numpy().astype('uint8'), [np.int32(dst)], True, 255, 3, cv2.LINE_AA)
+
+    _, h1, w1, _ = tmp_img.shape
+    h2, w2 = dst_img.shape
+    nWidth = w1 + w2
+    nHeight = max(h1, h2)
+    hdif = int((h2 - h1) / 2)
+    newimg = np.zeros((nHeight, nWidth, 3), np.uint8)
+
+    for i in range(3):
+        newimg[hdif:hdif + h1, :w1, i] = tf.squeeze(tmp_img).numpy().astype('uint8')
+        newimg[:h2, w1:w1 + w2, i] = dst_img
+
+    for i in range(src_pt.shape[0]):
+        pt1 = (int(src_pt[i, 0, 1]), int(src_pt[i, 0, 0] + hdif))
+        pt2 = (int(dst_pt[i, 0, 1] + w1), int(dst_pt[i, 0, 0]))
+        cv2.line(newimg, pt1, pt2, (255, 0, 0))
+    show_images([newimg], 1, 1)
 
 
 class OctavePyramid(list):
@@ -86,11 +153,14 @@ class OctavePyramid(list):
 
 @dataclass(eq=False, order=False)
 class KeyPoints:
+    # TODO: pt[-1] == layer dont need to save him --> need to change the Detector.orientation_assignment
     pt: tf.Tensor = tf.constant([[]], shape=(0, 4), dtype=tf.float32)
     size: tf.Tensor = tf.constant([[]], shape=(0, 1), dtype=tf.float32)
     angle: tf.Tensor = tf.constant([[]], shape=(0, 1), dtype=tf.float32)
     octave: tf.Tensor = tf.constant([[]], shape=(0, 1), dtype=tf.float32)
     response: tf.Tensor = tf.constant([[]], shape=(0, 1), dtype=tf.float32)
+    as_image_size: bool = False
+    unpacked_octave_ref: unpacked_octave = field(default=unpacked_octave, init=False)
 
     def __add__(self, other):
         if not isinstance(other, KeyPoints): raise TypeError
@@ -122,34 +192,53 @@ class KeyPoints:
         _len = (self.pt.shape[0],)
         return _len
 
-    def to_image_size(self, unpack_octave: bool = False):
-        if self.shape[0] == 9: return None
+    def to_image_size(self):
+        if self.shape[0] == 0: return None
+        if self.as_image_size: return self
         pt_unpack = self.pt * tf.constant([1.0, 0.5, 0.5, 1.0], dtype=tf.float32)
         size_unpack = self.size * 0.5
         octave_unpack = bitwise_ops.bitwise_xor(tf.cast(self.octave, dtype=tf.int64), 255)
-
         unpack_key_points = KeyPoints(
-            pt_unpack, size_unpack, self.angle, tf.cast(octave_unpack, dtype=tf.float32), self.response
+            pt_unpack, size_unpack, self.angle, tf.cast(octave_unpack, dtype=tf.float32), self.response, True
         )
-        if not unpack_octave:
-            return unpack_key_points
+        return unpack_key_points
 
+    def unpack_octave(self) -> unpacked_octave:
+        if self.shape[0] == 0: return None
+        up_key_points = self.to_image_size() if not self.as_image_size else self
+
+        octave_unpack = tf.cast(up_key_points.octave, tf.int64)
         octave = bitwise_ops.bitwise_and(octave_unpack, 255)
+        octave = bitwise_ops.bitwise_xor(octave, 255) - 1
+
         layer = bitwise_ops.right_shift(octave_unpack, 8)
         layer = bitwise_ops.bitwise_and(layer, 255)
-        octave = tf.where(octave >= 128, bitwise_ops.bitwise_or(octave, -128), octave)
+
         scale = tf.where(
             octave >= 0,
             tf.cast(1 / tf.bitwise.left_shift(1, octave), dtype=tf.float32),
             tf.cast(tf.bitwise.left_shift(1, -octave), dtype=tf.float32)
         )
-        unpacked_octave = namedtuple('unpacked_octave', 'octave, layer, scale')
-        unpacked_octave = unpacked_octave(tf.cast(octave, dtype=tf.float32), tf.cast(layer, dtype=tf.float32), scale)
-        return unpack_key_points, unpacked_octave
+        octave = octave + 1
+        return self.unpacked_octave_ref(tf.cast(octave, dtype=tf.float32), tf.cast(layer, dtype=tf.float32), scale)
 
     def stack(self) -> tf.Tensor:
         _stack = tf.concat(([self.pt, self.size, self.angle, self.octave, self.response]), axis=-1)
         return _stack
+
+    def dynamic_partition(self, split: str = 'batch') -> list:
+        if self.shape[0] == 0: return None
+        if split != 'batch' and split != 'octave': raise ValueError('split can be by "batch" or "octave"')
+        if split == 'batch':
+            part = tf.reshape(tf.cast(tf.split(self.pt, [1, 3], -1)[0], tf.int32), (-1,))
+        else:
+            unpack_ = self.unpack_octave()
+            part = tf.reshape(tf.cast(unpack_.octave, tf.int32), (-1,))
+        part = tf.dynamic_partition(self.stack(), part, tf.reduce_max(part) + 1)
+        out = [
+            KeyPoints(*tf.split(p, [4, 1, 1, 1, 1, ], -1), self.as_image_size) for p in part
+        ]
+        return out
 
 
 class Descriptor:
@@ -157,6 +246,153 @@ class Descriptor:
         self.N_bins = bins
         self.window_width = window_width
         self.scale_multiplier = scale_multiplier
+        self.descriptor_max_value = 0.2
+
+    def __split_parallel_jobs(self, key_points: KeyPoints, octave_pyramid: OctavePyramid) -> list[tuple]:
+        out_tup = namedtuple('job', 'octave_id, index, points, angle, width, radius')
+        out = []
+        key_points = key_points.to_image_size()
+        unpack_oct = key_points.unpack_octave()
+
+        parallel_octaves = tf.unique(tf.squeeze(unpack_oct.octave))
+
+        scale_ = tf.pad(tf.repeat(unpack_oct.scale, 2, axis=1), paddings=tf.constant([[0, 0], [1, 0]]),
+                        constant_values=1.0)
+        points = tf.round(tf.concat((tf.split(key_points.pt, [3, 1], -1)[0] * scale_, unpack_oct.layer), -1))
+        histogram_width = self.scale_multiplier * 0.5 * unpack_oct.scale * key_points.size
+        radius = tf.round(histogram_width * math_ops.sqrt(2.0) * (self.window_width + 1.0) * 0.5)
+
+        wrap = tf.concat(
+            (
+                tf.reshape(tf.range(key_points.shape[0], dtype=tf.float32), (-1, 1)),
+                points, key_points.angle, radius, histogram_width
+            ), -1
+        )
+        wrap = tf.dynamic_partition(wrap, parallel_octaves.idx, parallel_octaves.y.get_shape()[0])
+
+        for wrap_i, oc_id in zip(wrap, parallel_octaves.y):
+            index, points_i, angle_i, radius_i, width_i = tf.split(wrap_i, [1, 4, 1, 1, 1], -1)
+            _, y, x, _ = tf.split(points_i, [1] * 4, -1)
+            radius_i = math_ops.minimum(
+                math_ops.minimum(octave_pyramid[int(oc_id)].shape[1] - 3 - y,
+                                 octave_pyramid[int(oc_id)].shape[2] - 3 - x),
+                math_ops.minimum(math_ops.minimum(y, x), radius_i)
+            )
+            radius_i = tf.reshape(radius_i, (-1,))
+            parallel = tf.unique(radius_i)
+            wrap_i = tf.concat((index, points_i, angle_i, width_i), -1)
+            wrap_i = tf.dynamic_partition(wrap_i, parallel.idx, parallel.y.get_shape()[0])
+
+            for wrap_ij, r in zip(wrap_i, parallel.y):
+                if r == 0: continue
+                index_j, points_ij, angle_ij, width_ij = tf.split(wrap_ij, [1, 4, 1, 1], -1)
+                out.append(out_tup(int(oc_id), tf.cast(index_j, tf.int32), points_ij, angle_ij, width_ij, int(r)))
+
+        return out
+
+    def assign_descriptors(self, descriptors: tf.Tensor, bins: tf.Tensor, magnitude: tf.Tensor) -> tf.Tensor:
+        _, y, x, _ = tf.unstack(bins, 4, -1)
+        mask = tf.where((y > -1) & (y < self.window_width) & (x > -1) & (x < self.window_width), True, False)
+        magnitude = tf.boolean_mask(magnitude, mask)
+
+        b, y, x, z = tf.unstack(tf.boolean_mask(bins, mask), 4, -1)
+        bin_floor = [b] + [tf.round(tf.floor(h)) for h in [y, x, z]]
+        bin_frac = [tf.reshape(h - hf, (-1,)) for h, hf in zip([y, x, z], bin_floor[1:])]
+
+        y, x, z = bin_frac
+
+        _C0 = magnitude * (1 - y)
+        _C1 = magnitude * y
+
+        # interpolation in x direction
+        _C00 = _C0 * (1 - x)
+        _C01 = _C0 * x
+
+        _C10 = _C1 * (1 - x)
+        _C11 = _C1 * x
+
+        # interpolation in z direction
+        _C000 = _C00 * (1 - z)
+        _C001 = _C00 * z
+        _C010 = _C01 * (1 - z)
+        _C011 = _C01 * z
+        _C100 = _C10 * (1 - z)
+        _C101 = _C10 * z
+        _C110 = _C11 * (1 - z)
+        _C111 = _C11 * z
+
+        b, y, x, z = [tf.cast(c, tf.int32) for c in bin_floor]
+        descriptors = tf.tensor_scatter_nd_add(descriptors, tf.stack((b, y + 1, x + 1, z), -1), _C000)
+        descriptors = tf.tensor_scatter_nd_add(descriptors, tf.stack((b, y + 1, x + 1, (z + 1) % self.N_bins), -1),
+                                               _C001)
+
+        descriptors = tf.tensor_scatter_nd_add(descriptors, tf.stack((b, y + 1, x + 2, z), -1), _C010)
+        descriptors = tf.tensor_scatter_nd_add(descriptors, tf.stack((b, y + 1, x + 2, (z + 1) % self.N_bins), -1),
+                                               _C011)
+
+        descriptors = tf.tensor_scatter_nd_add(descriptors, tf.stack((b, y + 2, x + 1, z), -1), _C100)
+        descriptors = tf.tensor_scatter_nd_add(descriptors, tf.stack((b, y + 2, x + 1, (z + 1) % self.N_bins), -1),
+                                               _C101)
+
+        descriptors = tf.tensor_scatter_nd_add(descriptors, tf.stack((b, y + 2, x + 2, z), -1), _C110)
+        descriptors = tf.tensor_scatter_nd_add(descriptors, tf.stack((b, y + 2, x + 2, (z + 1) % self.N_bins), -1),
+                                               _C111)
+
+        return descriptors
+
+    def write_descriptors(self, key_points: KeyPoints, octave_pyramid: OctavePyramid) -> tf.Tensor:
+        bins_per_degree = self.N_bins / 360.
+        weight_multiplier = -1.0 / (0.5 * self.window_width * self.window_width)
+        descriptors = tf.zeros((key_points.shape[0], self.window_width + 2, self.window_width + 2, self.N_bins),
+                               tf.float32)
+        parallel = self.__split_parallel_jobs(key_points, octave_pyramid)
+
+        M = octave_pyramid[0].magnitude
+        T = octave_pyramid[0].orientation
+        prev_oc = 0
+
+        for job in parallel:
+            octave_id, index, points, angle, width, radius = job
+            angle = 360.0 - angle
+            n = points.get_shape()[0]
+            cos = math_ops.cos((PI / 180) * angle)
+            sin = math_ops.sin((PI / 180) * angle)
+            if prev_oc != octave_id:
+                M = octave_pyramid[octave_id].magnitude
+                T = octave_pyramid[octave_id].orientation
+                prev_oc = octave_id
+
+            neighbor = make_neighborhood2D(tf.constant([[0, 0, 0, 0]], dtype=tf.int64), con=(radius * 2) + 1)
+            block = tf.expand_dims(tf.cast(points, tf.int64), axis=1) + neighbor
+
+            neighbor = tf.cast(tf.repeat(tf.split(neighbor, [1, 2, 1], -1)[1], n, 0), tf.float32)
+            y, x = tf.unstack(neighbor, 2, -1)
+            b = tf.cast(tf.ones(y.get_shape(), dtype=tf.int32) * index, tf.float32)
+
+            rotate = [((x * sin) + (y * cos)) / width, ((x * cos) - (y * sin)) / width]
+            weight = tf.reshape(math_ops.exp(weight_multiplier * (rotate[0] ** 2 + rotate[1] ** 2)), (-1,))
+
+            magnitude = tf.gather_nd(M, tf.reshape(block, (-1, 4))) * weight
+            orientation = tf.reshape(tf.gather_nd(T, tf.reshape(block, (-1, 4))), (n, -1)) % 360.0
+            orientation = ((orientation - angle) * bins_per_degree) % self.N_bins
+
+            hist_bin = [b] + [rot + 0.5 * self.window_width - 0.5 for rot in rotate] + [orientation]
+            hist_bin = tf.reshape(tf.stack(hist_bin, -1), (-1, 4))
+
+            descriptors = self.assign_descriptors(descriptors, hist_bin, magnitude)
+
+        descriptors = tf.slice(descriptors, [0, 1, 1, 0],
+                               [key_points.shape[0], self.window_width, self.window_width, self.N_bins])
+        descriptors = tf.reshape(descriptors, (key_points.shape[0], -1))
+
+        threshold = tf.norm(descriptors, ord=2, axis=1, keepdims=True) * self.descriptor_max_value
+        threshold = tf.repeat(threshold, self.N_bins * self.window_width * self.window_width, 1)
+        descriptors = tf.where(descriptors > threshold, threshold, descriptors)
+        descriptors = descriptors / tf.maximum(tf.norm(descriptors, ord=2, axis=1, keepdims=True), 1e-7)
+        descriptors = tf.round(descriptors * 512)
+        descriptors = tf.maximum(descriptors, 0)
+        descriptors = tf.minimum(descriptors, 255)
+        return descriptors
 
 
 class Detector:
@@ -242,9 +478,10 @@ class Detector:
             oc = pyramid[-1]
             oc_kp = self.localize_extrema(oc)
             if oc_kp.shape[0] == 0: continue
-            key_points += self.orientation_assignment(oc, oc_kp)
+            oc_kp = self.orientation_assignment(oc, oc_kp)
+            key_points += oc_kp
 
-        return pyramid if levels_ex_ == 1 else key_points
+        return pyramid if levels_ex_ == 1 else (key_points, pyramid)
 
     def localize_extrema(self, octave: OctavePyramid.Octave) -> KeyPoints:
         dim = octave.shape[-1]
@@ -373,8 +610,7 @@ class Detector:
         kp_octave = octave_index + cz * (2 ** 8) + tf.round((ez + 0.5) * 255.0) * (2 ** 16)
 
         # size = (sigma << ((s + s') / sn)) << (octave_index + 1)
-        kp_size = self.sigma * (2 ** ((cz + ez) / tf.cast(dim - 3, dtype=tf.float32))) * (
-                2 ** (octave_index + 1.0))
+        kp_size = self.sigma * (2 ** ((cz + ez) / (dim - 3))) * (2 ** (octave_index + 1.0))
 
         # D(X') = D + 0.5 * (DD / Dx) * X'
         kp_response = math_ops.abs(tf.gather_nd(update_response, cords))
@@ -427,14 +663,17 @@ class Detector:
         index = tf.dynamic_partition(tf.reshape(tf.range(key_points.shape[0], dtype=tf.int64), (-1, 1)),
                                      parallel.idx, tf.reduce_max(parallel.idx) + 1)
 
+        M = octave.magnitude
+        T = octave.orientation
+
         for region_weight, r, hist_index in zip(split_region, parallel.y, index):
             region, weight = tf.split(region_weight, [4, 1], -1)
 
             neighbor = make_neighborhood2D(tf.constant([[0, 0, 0, 0]], dtype=tf.int64), con=(r * 2) + 1)
             block = tf.expand_dims(tf.cast(region, tf.int64), axis=1) + neighbor
 
-            magnitude = tf.gather_nd(octave.magnitude, tf.reshape(block, (-1, 4)))
-            orientation = tf.gather_nd(octave.orientation, tf.reshape(block, (-1, 4)))
+            magnitude = tf.gather_nd(M, tf.reshape(block, (-1, 4)))
+            orientation = tf.gather_nd(T, tf.reshape(block, (-1, 4)))
 
             _, curr_y, curr_x, _ = tf.unstack(tf.cast(neighbor, dtype=tf.float32), 4, axis=-1)
             weight = tf.reshape(math_ops.exp(weight * (curr_y ** 2 + curr_x ** 2)), (-1,))
@@ -480,17 +719,17 @@ class Detector:
 
         orientation = 360. - interp * 360. / 36
 
-        orientation = tf.where(orientation - 360. < 1e-7, 0.0, orientation)
+        orientation = tf.where(math_ops.abs(orientation - 360.) < 1e-7, 0.0, orientation)
 
         wrap = key_points.stack()
         wrap = tf.gather(wrap, p_idx)
-        pt, size, _, octave, response = tf.split(wrap, [4, 1, 1, 1, 1, ], axis=-1)
+        pt, size, _, oc, response = tf.split(wrap, [4, 1, 1, 1, 1, ], axis=-1)
 
         key_points_new = KeyPoints(
             pt=pt,
             size=size,
             angle=tf.reshape(orientation, (-1, 1)),
-            octave=octave,
+            octave=oc,
             response=response
         )
 
@@ -501,7 +740,7 @@ class Detector:
         self.__init_graph(self.__inputs_shape)
         return self.__graph(inputs, levels_ex_=1)
 
-    def extract_keypoints(self, inputs: tf.Tensor) -> KeyPoints:
+    def extract_keypoints(self, inputs: tf.Tensor) -> tuple[KeyPoints, OctavePyramid]:
         inputs = self.__validate_input(inputs)
         self.__init_graph(self.__inputs_shape)
         return self.__graph(inputs, levels_ex_=2)
@@ -518,9 +757,15 @@ class Detector:
 
 
 if __name__ == '__main__':
-    image = load_image('box.png')
+    image1 = load_image('box.png')
+    image2 = load_image('box_in_scene.png')
     alg = Detector()
+    disc = Descriptor()
 
-    kp = alg.extract_keypoints(image)
+    kp1, pyr_oc = alg.extract_keypoints(image1)
+    desc1 = disc.write_descriptors(kp1, pyr_oc)
 
-    # show_key_points(kp.to_image_size(), image)
+    kp2, pyr_oc = alg.extract_keypoints(image2)
+    desc2 = disc.write_descriptors(kp2, pyr_oc)
+
+    templet_matching(image1, image2, kp1, kp2, desc1, desc2)

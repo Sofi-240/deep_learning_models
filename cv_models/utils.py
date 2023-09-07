@@ -111,7 +111,7 @@ def make_neighborhood2D(
 
     ax = tf.range(-con // 2 + 1, (con // 2) + 1, dtype=tf.int64)
 
-    con_kernel = tf.stack(tf.meshgrid(ax, ax), axis=-1)
+    con_kernel = tf.stack(tf.meshgrid(ax, ax)[::-1], axis=-1)
 
     con_kernel = tf.reshape(con_kernel, shape=(1, con ** 2, 2))
 
