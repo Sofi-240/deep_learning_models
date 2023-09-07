@@ -296,6 +296,13 @@ class Descriptor:
         magnitude = tf.boolean_mask(magnitude, mask)
 
         b, y, x, z = tf.unstack(tf.boolean_mask(bins, mask), 4, -1)
+
+        while tf.reduce_min(z) < 0:
+            z = tf.where(z < 0, z + self.N_bins, z)
+
+        while tf.reduce_max(z) >= self.N_bins:
+            z = tf.where(z >= self.N_bins, z - self.N_bins, z)
+
         bin_floor = [b] + [tf.round(tf.floor(h)) for h in [y, x, z]]
         bin_frac = [tf.reshape(h - hf, (-1,)) for h, hf in zip([y, x, z], bin_floor[1:])]
 
@@ -374,7 +381,7 @@ class Descriptor:
 
             magnitude = tf.gather_nd(M, tf.reshape(block, (-1, 4))) * weight
             orientation = tf.reshape(tf.gather_nd(T, tf.reshape(block, (-1, 4))), (n, -1)) % 360.0
-            orientation = ((orientation - angle) * bins_per_degree) % self.N_bins
+            orientation = ((orientation - angle) * bins_per_degree)
 
             hist_bin = [b] + [rot + 0.5 * self.window_width - 0.5 for rot in rotate] + [orientation]
             hist_bin = tf.reshape(tf.stack(hist_bin, -1), (-1, 4))
